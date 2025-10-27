@@ -9,7 +9,7 @@ int main(){
     std::cout << "$ ";
     std::getline(std::cin, command);
 
-    if (command.substr(0, 13) == "print history"){
+    if (command == "print history"){
       std::ifstream file("kubsh_history");
       if (!file)
         std::cout << "No history yet!" << std::endl;
@@ -18,21 +18,25 @@ int main(){
         while (std::getline(file, komanda))
           std::cout << komanda << std::endl;
       }
+      continue;
     }
 
-    else if (command.substr(0, 13) == "clear history"){
+    else if (command == "clear history"){
       if (std::remove("kubsh_history") == 0)
         std::cout << "History cleared!" << std::endl;
       else
         std::cout << "No history file found!" << std::endl;
+      continue;
     }
 
-    if (command.substr(0, 13) != "print history" && command.substr(0, 13) != "clear history"){
-      std::ofstream file("kubsh_history", std::ios::app);
-      file << command << std::endl;
-    }
+    std::ofstream file("kubsh_history", std::ios::app);
+    file << command << std::endl;
 
-    if (command.substr(0, 2) == "\\q") return 0;
+    if (command.substr(0, 5) == "echo ") std::cout << command.substr(5) << std::endl;
+
+    else if (command == "\\q") return 0;
+
+    else std::cout << command << ": command not found" << std::endl;
   }
 
   return 0;
