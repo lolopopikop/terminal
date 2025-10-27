@@ -32,7 +32,16 @@ int main(){
     std::ofstream file("kubsh_history", std::ios::app);
     file << command << std::endl;
 
-    if (command.substr(0, 5) == "echo ") std::cout << command.substr(5) << std::endl;
+    if (command.substr(0, 5) == "echo ") {
+      std::string arg = command.substr(5);
+
+      if (arg == "$PATH"){
+        char* path = std::getenv("PATH");
+        if (path) std::cout << path << std::endl;
+        else std::cout << "PATH environment variable is not set!" << std::endl;
+      }
+      else std::cout << arg << std::endl;
+    }
 
     else if (command == "\\q") return 0;
 
