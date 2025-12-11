@@ -42,16 +42,40 @@ static int system_user_exists(const char *username) {
 }
 
 static void populate_users() {
+
+    // 1) УДАЛЯЕМ ВСЕ НЕСУЩЕСТВУЮЩИЕ СИСТЕМНЫЕ ПОЛЬЗОВАТЕЛЬСКИЕ ДИРЕКТОРИИ
+    DIR *d = opendir(vfs_root);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d))) {
+            if (strcmp(ent->d_name, ".") == 0 ||
+                strcmp(ent->d_name, "..") == 0)
+                continue;
+
+            // ent->d_name — имя директории
+            if (!system_user_exists(ent->d_name)) {
+                char buf[600];
+                snprintf(buf, sizeof(buf), "%s/%s", vfs_root, ent->d_name);
+                rmdir(buf);  // удаляем "левую" директорию
+            }
+        }
+        closedir(d);
+    }
+
+    // 2) ЧИТАЕМ /etc/passwd И СОЗДАЁМ ТОЛЬКО SH-ПОЛЬЗОВАТЕЛЕЙ
     FILE *f = fopen("/etc/passwd", "r");
     if (!f) return;
 
     char line[512];
     while (fgets(line, sizeof(line), f)) {
+
         char *shell = strrchr(line, ':');
         if (!shell) continue;
         shell++;
 
-        if (!strstr(shell, "sh")) continue;
+        // только shell-пользователи
+        if (!strstr(shell, "sh"))
+            continue;
 
         char *name_end = strchr(line, ':');
         if (!name_end) continue;
@@ -66,34 +90,21 @@ static void populate_users() {
     fclose(f);
 }
 
+
 int start_users_vfs(const char *mount_point) {
 
     strncpy(vfs_root, mount_point, sizeof(vfs_root)-1);
     ensure_dir(vfs_root);
 
     if (getenv("CI")) {
-        printf("---\nCI ENV detected — disabling FUSE but populating VFS\n");
-
-        DIR *d = opendir(vfs_root);
-        if (d) {
-            struct dirent *ent;
-            while ((ent = readdir(d))) {
-                if (strcmp(ent->d_name, ".") == 0 ||
-                    strcmp(ent->d_name, "..") == 0)
-                    continue;
-
-                char buf[600];
-                snprintf(buf, sizeof(buf), "%s/%s", vfs_root, ent->d_name);
-                unlink(buf);
-                rmdir(buf);
-            }
-            closedir(d);
-        }
+        // В CI: FUSE не монтируем, но VFS ДОЛЖЕН работать полностью.
+        printf("---\nCI ENV detected — FUSE disabled, VFS active\n");
 
         populate_users();
-        vfs_enabled = 0;
+        vfs_enabled = 1;     // ВАЖНО: VFS НЕ отключаем
         return 0;
     }
+
 
     vfs_enabled = 1;
 
