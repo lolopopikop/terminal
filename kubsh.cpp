@@ -345,7 +345,10 @@ int main(int argc, char* argv[]) {
     /* history */
     std::string history_file = get_history_file();
     using_history();
-    read_history(history_file.c_str());
+    // only read history if file exists to avoid warnings
+    if (std::filesystem::exists(history_file)) {
+        read_history(history_file.c_str());
+    }
 
     /* detect interactive */
     bool interactive = isatty(STDIN_FILENO);
@@ -404,7 +407,7 @@ int main(int argc, char* argv[]) {
                     perror("fork");
                 }
             }
-            // keep process alive for tests (tests expect kubsh running)
+            // do NOT exit here — tests expect kubsh to be a running process (VFS emulation)
         }
     }
 
@@ -515,9 +518,9 @@ int main(int argc, char* argv[]) {
     running.store(false);
     if (test_mode) {
         if (test_vfs_thread.joinable()) {
-            // politely wait a tiny bit for thread to finish
+            // politely wait a tiny bit for thread to notice running==false
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            test_vfs_thread.detach(); // don't block shutdown waiting on thread
+            test_vfs_thread.detach();
         }
     }
 
