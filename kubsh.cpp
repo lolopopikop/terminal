@@ -21,9 +21,8 @@
 #include <filesystem>
 #include <chrono>
 #include <mutex>
-#include <sys/inotify.h>
-#include <fcntl.h>
-#include <errno.h>
+#include <set>
+#include <limits.h>
 
 extern char **environ;
 
@@ -124,9 +123,9 @@ void cleanup() {
     stop_users_vfs();
 }
 
-/* --- Test-mode VFS emulation ---
+/* --- Test-mode VFS emulation (polling) ---
    - populate "users" directory from /etc/passwd (only shells ending with "sh")
-   - watch users dir via inotify: when new directory is created, add user to /etc/passwd
+   - poll users dir every 100ms: when new directory appears, add user to /etc/passwd
 */
 static std::mutex passwd_mutex;
 
@@ -154,6 +153,7 @@ static int passwd_max_uid() {
     int max_uid = 1000;
     while (fgets(line, sizeof(line), f)) {
         // fields: name:passwd:uid:gid:gecos:home:shell
+        // parse uid (third field)
         char *p = strchr(line, ':');
         if (!p) continue;
         p = strchr(p+1, ':');
@@ -178,12 +178,10 @@ static bool add_user_to_passwd(const std::string &username) {
 
     FILE *f = fopen("/etc/passwd", "a");
     if (!f) return false;
-    // basic entry: username:x:uid:uid::/home/username:/bin/bash
     int written = fprintf(f, "%s:x:%d:%d::/home/%s:/bin/bash\n", username.c_str(), new_uid, new_uid, username.c_str());
     fclose(f);
     if (written < 0) return false;
 
-    // create home dir
     std::string home = std::string("/home/") + username;
     mkdir(home.c_str(), 0755);
 
@@ -192,102 +190,103 @@ static bool add_user_to_passwd(const std::string &username) {
 
 /* Populate mountpoint from /etc/passwd (only shells ending with sh) */
 static void populate_users_dir_from_passwd(const std::string &mountpoint) {
-    // create mountpoint if missing
     std::filesystem::create_directories(mountpoint);
     setpwent();
     struct passwd *pwd;
     while ((pwd = getpwent()) != NULL) {
         if (pwd->pw_name && pwd->pw_shell && ends_with_sh(std::string(pwd->pw_shell))) {
             std::string path = mountpoint + "/" + pwd->pw_name;
-            // create dir if missing
             std::error_code ec;
             std::filesystem::create_directories(path, ec);
             (void)ec;
+            // create simple files (id/home/shell) to mimic VFS files
+            std::string idf = path + "/id";
+            std::string homef = path + "/home";
+            std::string shellf = path + "/shell";
+            FILE *idw = fopen(idf.c_str(), "w");
+            if (idw) {
+                fprintf(idw, "%d", pwd->pw_uid);
+                fclose(idw);
+            }
+            FILE *hw = fopen(homef.c_str(), "w");
+            if (hw) {
+                fprintf(hw, "%s", pwd->pw_dir ? pwd->pw_dir : "");
+                fclose(hw);
+            }
+            FILE *sw = fopen(shellf.c_str(), "w");
+            if (sw) {
+                fprintf(sw, "%s", pwd->pw_shell ? pwd->pw_shell : "");
+                fclose(sw);
+            }
         }
     }
     endpwent();
 }
 
-/* Watches mountpoint with inotify; when a new directory appears -> add user to /etc/passwd */
-static void watch_users_dir_and_sync_passwd(const std::string &mountpoint) {
-    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (fd < 0) {
-        // cannot watch — just return
-        return;
+/* Polling watcher: checks for new subdirectories and adds users to /etc/passwd */
+static void poll_users_dir_and_sync_passwd(const std::string &mountpoint) {
+    std::set<std::string> seen;
+    // initial scan
+    if (!std::filesystem::exists(mountpoint)) {
+        std::filesystem::create_directories(mountpoint);
     }
-
-    int wd = inotify_add_watch(fd, mountpoint.c_str(), IN_CREATE | IN_MOVED_TO);
-    if (wd < 0) {
-        close(fd);
-        return;
+    for (auto &p : std::filesystem::directory_iterator(mountpoint)) {
+        if (p.is_directory()) {
+            seen.insert(p.path().filename().string());
+        }
     }
-
-    const size_t buf_sz = (sizeof(struct inotify_event) + NAME_MAX + 1) * 32;
-    std::vector<char> buf(buf_sz);
 
     while (running.load()) {
-        ssize_t len = read(fd, buf.data(), (int)buf.size());
-        if (len <= 0) {
-            // no events; sleep a bit
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-
-        size_t i = 0;
-        while (i < (size_t)len) {
-            struct inotify_event *ev = (struct inotify_event*)(buf.data() + i);
-            if (ev->len > 0) {
-                std::string name(ev->name);
-                if ((ev->mask & IN_ISDIR) || (ev->mask & IN_CREATE) || (ev->mask & IN_MOVED_TO)) {
-                    // ensure it's a directory (sometimes create event for file)
-                    std::string path = mountpoint + "/" + name;
-                    struct stat st;
-                    if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-                        // add to /etc/passwd if missing
-                        if (!passwd_has_user(name)) {
-                            bool ok = add_user_to_passwd(name);
-                            if (ok) {
-                                // optionally create id/home/shell files inside mountpoint (tests may not require)
-                                // create simple files
-                                std::string idf = path + "/id";
-                                std::string homef = path + "/home";
-                                std::string shellf = path + "/shell";
-                                FILE *idw = fopen(idf.c_str(), "w");
-                                if (idw) {
-                                    int uid = passwd_max_uid(); // max after addition
-                                    fprintf(idw, "%d", uid);
-                                    fclose(idw);
-                                }
-                                FILE *hw = fopen(homef.c_str(), "w");
-                                if (hw) {
-                                    fprintf(hw, "/home/%s", name.c_str());
-                                    fclose(hw);
-                                }
-                                FILE *sw = fopen(shellf.c_str(), "w");
-                                if (sw) {
-                                    fprintf(sw, "/bin/bash");
-                                    fclose(sw);
-                                }
+        // Rescan
+        try {
+            for (auto &p : std::filesystem::directory_iterator(mountpoint)) {
+                if (!p.is_directory()) continue;
+                std::string name = p.path().filename().string();
+                if (seen.find(name) == seen.end()) {
+                    // new dir
+                    seen.insert(name);
+                    // create passwd entry if missing
+                    if (!passwd_has_user(name)) {
+                        bool ok = add_user_to_passwd(name);
+                        if (ok) {
+                            // write id/home/shell files
+                            std::string path = mountpoint + "/" + name;
+                            std::string idf = path + "/id";
+                            std::string homef = path + "/home";
+                            std::string shellf = path + "/shell";
+                            FILE *idw = fopen(idf.c_str(), "w");
+                            if (idw) {
+                                int uid = passwd_max_uid();
+                                fprintf(idw, "%d", uid);
+                                fclose(idw);
+                            }
+                            FILE *hw = fopen(homef.c_str(), "w");
+                            if (hw) {
+                                fprintf(hw, "/home/%s", name.c_str());
+                                fclose(hw);
+                            }
+                            FILE *sw = fopen(shellf.c_str(), "w");
+                            if (sw) {
+                                fprintf(sw, "/bin/bash");
+                                fclose(sw);
                             }
                         }
                     }
                 }
             }
-            i += sizeof(struct inotify_event) + ev->len;
+        } catch (...) {
+            // ignore transient FS errors
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-
-    inotify_rm_watch(fd, wd);
-    close(fd);
 }
 
 /* Initialize a simple test-mode VFS (non-FUSE) */
 static std::thread start_test_vfs(const std::string &mountpoint) {
-    // populate immediately
     populate_users_dir_from_passwd(mountpoint);
-    // start watcher thread
+    // start polling thread
     std::thread t([mountpoint]() {
-        watch_users_dir_and_sync_passwd(mountpoint);
+        poll_users_dir_and_sync_passwd(mountpoint);
     });
     return t;
 }
@@ -311,7 +310,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: kubsh [OPTIONS]\n"
                       << "Options:\n"
                       << "  --no-vfs    Disable VFS auto-mount\n"
-                      << "  --test      Test mode (CI safe, disables FUSE but emulates VFS)\n"
+                      << "  --test      Test mode (CI safe, emulates VFS in users/)\n"
                       << "  --help, -h  Show this help\n";
             return 0;
         }
@@ -327,21 +326,18 @@ int main(int argc, char* argv[]) {
     if (test_mode) {
         auto_vfs = false; // disable real FUSE
         const std::string mountpoint = "users";
-        // create mountpoint and populate from /etc/passwd
         std::filesystem::create_directories(mountpoint);
         test_vfs_thread = start_test_vfs(mountpoint);
-        // leave thread running while program runs
     } else {
         // start FUSE-based vfs if requested (original behavior)
         if (auto_vfs) {
             mkdir("users", 0755);
             std::thread vfs_thread([]() {
                 if (start_users_vfs("users") != 0) {
-                    std::cerr << "Warning: Failed to start users VFS\n";
+                    // warning suppressed
                 }
             });
             vfs_thread.detach();
-            // small sleep to give VFS time to mount
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
@@ -408,13 +404,11 @@ int main(int argc, char* argv[]) {
                     perror("fork");
                 }
             }
-            // keep running (tests expect kubsh process to be alive). Do not exit immediately.
-            // But if you prefer to exit after commands, uncomment next line:
-            // return 0;
+            // keep process alive for tests (tests expect kubsh running)
         }
     }
 
-    /* Interactive loop */
+    /* Interactive / main loop */
     while (running.load()) {
         if (reload_config) {
             std::cout << "Configuration reloaded" << std::endl;
@@ -425,14 +419,9 @@ int main(int argc, char* argv[]) {
         if (interactive) {
             line = readline("$ ");
         } else {
-            // in non-interactive mode we wait for stdin or sleep to avoid busy loop
-            std::string input;
-            if (!std::getline(std::cin, input)) {
-                // no stdin data; sleep a bit and continue (this keeps process alive for tests)
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                continue;
-            }
-            line = strdup(input.c_str());
+            // No stdin input: sleep a bit (keeps process alive and avoids busy loop)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
         }
 
         if (!line) continue;
@@ -524,11 +513,12 @@ int main(int argc, char* argv[]) {
 
     /* shutdown */
     running.store(false);
-    // join test vfs thread if running
     if (test_mode) {
-        // signal watcher to stop and give it a bit
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (test_vfs_thread.joinable()) test_vfs_thread.detach();
+        if (test_vfs_thread.joinable()) {
+            // politely wait a tiny bit for thread to finish
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            test_vfs_thread.detach(); // don't block shutdown waiting on thread
+        }
     }
 
     cleanup();
