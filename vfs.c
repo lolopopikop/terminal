@@ -6,6 +6,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <dirent.h>   // ← ЭТО ГЛАВНАЯ ФИКС
+#include <fcntl.h>
 
 static int vfs_enabled = 1;
 static char vfs_root[512] = {0};
@@ -19,45 +21,33 @@ static int ensure_dir(const char *path) {
 }
 
 int start_users_vfs(const char *mount_point) {
-    // CI MODE — disable FUSE completely, use simple dir-based VFS
+
     if (getenv("CI")) {
         printf("---\nCI ENV detected — disabling VFS\n");
         vfs_enabled = 0;
 
         strncpy(vfs_root, mount_point, sizeof(vfs_root)-1);
-        ensure_dir(vfs_root); // ensure tests/users exists
+        ensure_dir(vfs_root); // tests/users
 
         return 0;
     }
 
-    // NORMAL MODE — real FUSE logic would be here
     vfs_enabled = 1;
     strncpy(vfs_root, mount_point, sizeof(vfs_root)-1);
+    ensure_dir(vfs_root);
 
-    // You can add your real FUSE initialization here when needed.
-    // For now do nothing to avoid blocking.
     return 0;
 }
 
 void stop_users_vfs() {
-    // In CI — nothing to stop
-    if (getenv("CI")) {
-        return;
-    }
-    // In normal mode — stop FUSE if added later
+    // nothing for now
 }
 
 int vfs_add_user(const char *username) {
     char path[600];
 
-    // Disabled in CI
-    if (!vfs_enabled || getenv("CI")) {
-        snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
-        return ensure_dir(path);
-    }
-
-    // Normal mode FUSE add
     snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
+
     return ensure_dir(path);
 }
 
@@ -70,25 +60,6 @@ int vfs_user_exists(const char *username) {
 }
 
 void vfs_list_users(void (*callback)(const char *)) {
-    // In CI — just list directories in vfs_root
-    if (getenv("CI")) {
-        DIR *d = opendir(vfs_root);
-        if (!d) return;
-
-        struct dirent *ent;
-        while ((ent = readdir(d))) {
-            if (ent->d_type == DT_DIR &&
-                strcmp(ent->d_name, ".") != 0 &&
-                strcmp(ent->d_name, "..") != 0)
-            {
-                callback(ent->d_name);
-            }
-        }
-        closedir(d);
-        return;
-    }
-
-    // Normal mode (no FUSE implemented)
     DIR *d = opendir(vfs_root);
     if (!d) return;
 
@@ -101,5 +72,6 @@ void vfs_list_users(void (*callback)(const char *)) {
             callback(ent->d_name);
         }
     }
+
     closedir(d);
 }
