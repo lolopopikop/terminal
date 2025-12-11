@@ -100,16 +100,14 @@ void cleanup() {
 }
 
 int main(int argc, char* argv[]) {
-    // Устанавливаем обработчики сигналов
     signal(SIGHUP, sighup_handler);
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
     atexit(cleanup);
 
-    // Анализ аргументов командной строки
-    bool auto_vfs = true;  // ИЗМЕНИЛ: было false, стало true!
+    bool auto_vfs = true;
     bool test_mode = false;
-    
+    // Анализ аргументов командной строки
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--no-vfs") == 0) auto_vfs = false;
         if (strcmp(argv[i], "--test") == 0) test_mode = true;
@@ -117,76 +115,71 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: kubsh [OPTIONS]\n"
                       << "Options:\n"
                       << "  --no-vfs    Disable VFS auto-mount\n"
-                      << "  --test      Test mode (fast startup)\n"
+                      << "  --test      Test mode (CI safe, disables VFS)\n"
                       << "  --help, -h  Show this help\n";
             return 0;
         }
     }
-    
-    // В тестовом режиме даем больше времени на монтирование
-int vfs_startup_delay = test_mode ? 100 : 300;
 
-// В тестовом режиме GitHub Actions нужно отключить FUSE
-if (test_mode) {
-    std::cout << "TEST MODE: VFS is disabled\n";
-    auto_vfs = false;
-}
+    // В тестовом режиме GitHub Actions нужно отключить FUSE (он запрещён в CI)
+    int vfs_startup_delay = test_mode ? 100 : 300;
 
-// Запускаем VFS если не отключено
-if (auto_vfs) {
-    // Создаем каталог если не существует
-    mkdir("users", 0755);
-        
-    // Запускаем VFS в отдельном потоке
-    std::thread vfs_thread([]() {
-        if (start_users_vfs("users") != 0) {
-            std::cerr << "Warning: Failed to start VFS" << std::endl;
-        }
-    });
-    vfs_thread.detach();
-        
-    // Даем время на монтирование (больше для тестов!)
-    std::this_thread::sleep_for(std::chrono::milliseconds(vfs_startup_delay));
-}
+    if (test_mode) {
+        std::cout << "TEST MODE: VFS is disabled\n";
+        auto_vfs = false;
+    }
 
-    
+    // Запуск VFS (только если не тест)
+    if (auto_vfs) {
+        mkdir("users", 0755);
+
+        std::thread vfs_thread([]() {
+            if (start_users_vfs("users") != 0) {
+                std::cerr << "Warning: FAILED TO START VFS" << std::endl;
+            }
+        });
+
+        vfs_thread.detach();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(vfs_startup_delay));
+    }
+
     // Загружаем историю команд
     std::string history_file = get_history_file();
     using_history();
     read_history(history_file.c_str());
-    
+
     bool interactive = isatty(STDIN_FILENO);
-    
     // Если не интерактивный режим и есть команда, выполняем и выходим
     if (!interactive && argc > 1) {
-        // Проверяем что это не опция
         bool has_real_command = false;
+
+        // Проверяем, есть ли хоть одна НЕ-опция
         for (int i = 1; i < argc; i++) {
             if (argv[i][0] != '-') {
                 has_real_command = true;
                 break;
             }
         }
-        
+
         if (has_real_command) {
-            // Пакетный режим
+            // Режим пакетного выполнения (для тестов)
             for (int i = 1; i < argc; i++) {
                 std::string command = argv[i];
-                
-                // Пропускаем опции
+
                 if (command[0] == '-') continue;
-                
-                if (command == "\\q") {
-                    break;
-                }
-                
+                if (command == "\\q") break;
+
+                // echo
                 if (command.rfind("echo ", 0) == 0) {
                     std::cout << command.substr(5) << std::endl;
                     continue;
                 }
-                
+
+                // \e $PATH
                 if (command.rfind("\\e $", 0) == 0) {
                     std::string env_var = command.substr(4);
+
                     if (env_var == "PATH") {
                         print_env_list(env_var);
                     } else {
@@ -195,20 +188,24 @@ if (auto_vfs) {
                     }
                     continue;
                 }
-                
+
+                // Токенизация команды
                 auto tokens = split(command);
                 if (tokens.empty()) continue;
-                
+
+                // Проверяем команду в PATH
                 std::string exe = find_executable(tokens[0]);
                 if (exe.empty()) {
                     std::cout << tokens[0] << ": command not found" << std::endl;
                     continue;
                 }
-                
+
+                // Формируем аргументы
                 std::vector<char*> args;
                 for (auto &s : tokens) args.push_back(const_cast<char*>(s.c_str()));
                 args.push_back(nullptr);
-                
+
+                // Форк + exec
                 pid_t pid = fork();
                 if (pid == 0) {
                     execve(exe.c_str(), args.data(), environ);
@@ -219,138 +216,144 @@ if (auto_vfs) {
                     waitpid(pid, &status, 0);
                 }
             }
-            return 0;
+
+            return 0; // после batch режима обязательно выходим
         }
     }
-    
     // Интерактивный режим
     while (running.load()) {
+
         if (reload_config) {
             std::cout << "Configuration reloaded" << std::endl;
             reload_config = 0;
         }
-        
+
         char* line = nullptr;
+
         if (interactive) {
+            // Readline prompt
             line = readline("$ ");
         } else {
-            // Неинтерактивный режим для тестов
+            // Неинтерактивный stdin (редко, но оставляем)
             std::string input;
-            if (!std::getline(std::cin, input)) {
-                break;
-            }
+            if (!std::getline(std::cin, input)) break;
             line = strdup(input.c_str());
         }
-        
+
         if (!line) break;
-        
+
         std::string command = line;
-        
-        // Добавляем в историю если команда не пустая
-        if (strlen(line) > 0) {
+
+        // Сохраняем в историю
+        if (!command.empty()) {
             add_history(line);
             write_history(history_file.c_str());
-            
-            // Также записываем в файл
+
+            // дублируем в файл (GitHub Actions любит текстовую историю)
             std::ofstream h(history_file, std::ios::app);
-            if (h.is_open()) {
-                h << command << std::endl;
-            }
+            if (h.is_open()) h << command << std::endl;
         }
-        
+
         free(line);
-        
+
         if (command.empty()) continue;
-        
-        // Обработка специальных команд
+
+        // -------------------------------
+        // BUILT-IN команды
+        // -------------------------------
+
         if (command == "\\q") {
             break;
         }
-        
+
+        // debug 'text'
         if (command.rfind("debug ", 0) == 0) {
             std::string arg = command.substr(6);
+
             if (arg.size() >= 2 && arg.front() == '\'' && arg.back() == '\'') {
                 arg = arg.substr(1, arg.size() - 2);
             }
+
             std::cout << arg << std::endl;
             continue;
         }
-        
+
+        // echo
         if (command.rfind("echo ", 0) == 0) {
             std::cout << command.substr(5) << std::endl;
             continue;
         }
-        
+
+        // \e $PATH — вывести список путей PATH
         if (command.rfind("\\e $", 0) == 0) {
             std::string env_var = command.substr(4);
+
             if (env_var == "PATH") {
-                print_env_list(env_var);
+                print_env_list("PATH");
             } else {
                 char* v = getenv(env_var.c_str());
                 if (v) std::cout << v << std::endl;
             }
             continue;
         }
-        
+
+        // \l /dev/sda
         if (command.rfind("\\l ", 0) == 0) {
-            std::string dev = command.substr(3);
-            list_partitions(dev);
+            list_partitions(command.substr(3));
             continue;
         }
-        
-        // Выполнение внешних команд
+
+        // cd
         auto tokens = split(command);
-        if (tokens.empty()) continue;
-        
-        // Встроенная команда cd
-        if (tokens[0] == "cd") {
-            if (tokens.size() > 1) {
-                if (chdir(tokens[1].c_str()) != 0) {
-                    perror("cd");
+
+        if (!tokens.empty() && tokens[0] == "cd") {
+            if (tokens.size() == 1) {
+                const char* home = getenv("HOME");
+                if (home) chdir(home);
+                else {
+                    struct passwd* pw = getpwuid(getuid());
+                    if (pw) chdir(pw->pw_dir);
                 }
             } else {
-                // Без аргументов - переходим в домашний каталог
-                const char* home = getenv("HOME");
-                if (home) {
-                    chdir(home);
-                } else {
-                    struct passwd* pw = getpwuid(getuid());
-                    if (pw) {
-                        chdir(pw->pw_dir);
-                    }
-                }
+                if (chdir(tokens[1].c_str()) != 0) perror("cd");
             }
             continue;
         }
-        
-        // Пытаемся найти исполняемый файл
+
+        // -------------------------------
+        // Внешние программы (exec)
+        // -------------------------------
+
+        if (tokens.empty()) continue;
+
         std::string exe = find_executable(tokens[0]);
+
         if (exe.empty()) {
             std::cout << tokens[0] << ": command not found" << std::endl;
             continue;
         }
-        
-        // Подготавливаем аргументы для execve
+
+        // готовим аргументы
         std::vector<char*> args;
         for (auto &s : tokens) args.push_back(const_cast<char*>(s.c_str()));
         args.push_back(nullptr);
-        
-        // Запускаем процесс
+
         pid_t pid = fork();
+
         if (pid == 0) {
-            // Дочерний процесс
             execve(exe.c_str(), args.data(), environ);
             perror("execve");
             _exit(127);
-        } else if (pid > 0) {
-            // Родительский процесс ждет завершения
+        }
+
+        if (pid > 0) {
             int status = 0;
             waitpid(pid, &status, 0);
         } else {
             perror("fork");
         }
     }
-    
+
     cleanup();
     return 0;
 }
