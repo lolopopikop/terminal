@@ -1,4 +1,4 @@
-// kubsh.cpp
+// kubsh.cpp  — исправленная версия для CI / тестов
 #include <iostream>
 #include <string>
 #include <fstream>
@@ -22,7 +22,6 @@
 #include <chrono>
 #include <mutex>
 #include <set>
-#include <limits.h>
 
 extern char **environ;
 
@@ -125,7 +124,7 @@ void cleanup() {
 
 /* --- Test-mode VFS emulation (polling) ---
    - populate "users" directory from /etc/passwd (only shells ending with "sh")
-   - poll users dir every 100ms: when new directory appears, add user to /etc/passwd
+   - poll users dir every 50ms: when new directory appears, add user to /etc/passwd
 */
 static std::mutex passwd_mutex;
 
@@ -153,13 +152,11 @@ static int passwd_max_uid() {
     int max_uid = 1000;
     while (fgets(line, sizeof(line), f)) {
         // fields: name:passwd:uid:gid:gecos:home:shell
-        // parse uid (third field)
         char *p = strchr(line, ':');
         if (!p) continue;
         p = strchr(p+1, ':');
         if (!p) continue;
         p = p+1;
-        // p points to uid
         int uid = atoi(p);
         if (uid > max_uid) max_uid = uid;
     }
@@ -199,25 +196,16 @@ static void populate_users_dir_from_passwd(const std::string &mountpoint) {
             std::error_code ec;
             std::filesystem::create_directories(path, ec);
             (void)ec;
-            // create simple files (id/home/shell) to mimic VFS files
+            // create simple files (id/home/shell)
             std::string idf = path + "/id";
             std::string homef = path + "/home";
             std::string shellf = path + "/shell";
             FILE *idw = fopen(idf.c_str(), "w");
-            if (idw) {
-                fprintf(idw, "%d", pwd->pw_uid);
-                fclose(idw);
-            }
+            if (idw) { fprintf(idw, "%d", pwd->pw_uid); fclose(idw); }
             FILE *hw = fopen(homef.c_str(), "w");
-            if (hw) {
-                fprintf(hw, "%s", pwd->pw_dir ? pwd->pw_dir : "");
-                fclose(hw);
-            }
+            if (hw) { fprintf(hw, "%s", pwd->pw_dir ? pwd->pw_dir : ""); fclose(hw); }
             FILE *sw = fopen(shellf.c_str(), "w");
-            if (sw) {
-                fprintf(sw, "%s", pwd->pw_shell ? pwd->pw_shell : "");
-                fclose(sw);
-            }
+            if (sw) { fprintf(sw, "%s", pwd->pw_shell ? pwd->pw_shell : ""); fclose(sw); }
         }
     }
     endpwent();
@@ -226,30 +214,21 @@ static void populate_users_dir_from_passwd(const std::string &mountpoint) {
 /* Polling watcher: checks for new subdirectories and adds users to /etc/passwd */
 static void poll_users_dir_and_sync_passwd(const std::string &mountpoint) {
     std::set<std::string> seen;
-    // initial scan
-    if (!std::filesystem::exists(mountpoint)) {
-        std::filesystem::create_directories(mountpoint);
-    }
+    if (!std::filesystem::exists(mountpoint)) std::filesystem::create_directories(mountpoint);
     for (auto &p : std::filesystem::directory_iterator(mountpoint)) {
-        if (p.is_directory()) {
-            seen.insert(p.path().filename().string());
-        }
+        if (p.is_directory()) seen.insert(p.path().filename().string());
     }
 
     while (running.load()) {
-        // Rescan
         try {
             for (auto &p : std::filesystem::directory_iterator(mountpoint)) {
                 if (!p.is_directory()) continue;
                 std::string name = p.path().filename().string();
                 if (seen.find(name) == seen.end()) {
-                    // new dir
                     seen.insert(name);
-                    // create passwd entry if missing
                     if (!passwd_has_user(name)) {
                         bool ok = add_user_to_passwd(name);
                         if (ok) {
-                            // write id/home/shell files
                             std::string path = mountpoint + "/" + name;
                             std::string idf = path + "/id";
                             std::string homef = path + "/home";
@@ -261,45 +240,37 @@ static void poll_users_dir_and_sync_passwd(const std::string &mountpoint) {
                                 fclose(idw);
                             }
                             FILE *hw = fopen(homef.c_str(), "w");
-                            if (hw) {
-                                fprintf(hw, "/home/%s", name.c_str());
-                                fclose(hw);
-                            }
+                            if (hw) { fprintf(hw, "/home/%s", name.c_str()); fclose(hw); }
                             FILE *sw = fopen(shellf.c_str(), "w");
-                            if (sw) {
-                                fprintf(sw, "/bin/bash");
-                                fclose(sw);
-                            }
+                            if (sw) { fprintf(sw, "/bin/bash"); fclose(sw); }
                         }
                     }
                 }
             }
-        } catch (...) {
-            // ignore transient FS errors
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } catch (...) { }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
 /* Initialize a simple test-mode VFS (non-FUSE) */
 static std::thread start_test_vfs(const std::string &mountpoint) {
     populate_users_dir_from_passwd(mountpoint);
-    // start polling thread
-    std::thread t([mountpoint]() {
-        poll_users_dir_and_sync_passwd(mountpoint);
-    });
+    // start polling thread (detached style: return thread to detach in caller)
+    std::thread t([mountpoint]() { poll_users_dir_and_sync_passwd(mountpoint); });
     return t;
 }
 
 /* Main */
 int main(int argc, char* argv[]) {
+    /* disable stdout buffering to avoid test hangs waiting for output */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     /* setup signals and exit cleanup */
     signal(SIGHUP, sighup_handler);
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
     atexit(cleanup);
 
-    /* arguments */
     bool auto_vfs = true;
     bool test_mode = false;
 
@@ -317,24 +288,24 @@ int main(int argc, char* argv[]) {
     }
 
     /* If CI environment variable present, treat as test-mode safe */
-    if (getenv("CI")) {
-        test_mode = true;
-    }
+    if (getenv("CI")) test_mode = true;
 
-    /* In test mode we must not use FUSE; we'll emulate VFS in users/ */
     std::thread test_vfs_thread;
     if (test_mode) {
-        auto_vfs = false; // disable real FUSE
+        auto_vfs = false; // never start real FUSE in CI/test mode
         const std::string mountpoint = "users";
         std::filesystem::create_directories(mountpoint);
         test_vfs_thread = start_test_vfs(mountpoint);
+        // Print readiness so tests that wait for output continue
+        std::cout << "TEST MODE: VFS emulation started\n";
+        std::cout << "READY\n";
+        fflush(stdout);
     } else {
-        // start FUSE-based vfs if requested (original behavior)
         if (auto_vfs) {
             mkdir("users", 0755);
             std::thread vfs_thread([]() {
                 if (start_users_vfs("users") != 0) {
-                    // warning suppressed
+                    std::cerr << "Warning: Failed to start users VFS\n";
                 }
             });
             vfs_thread.detach();
@@ -345,10 +316,7 @@ int main(int argc, char* argv[]) {
     /* history */
     std::string history_file = get_history_file();
     using_history();
-    // only read history if file exists to avoid warnings
-    if (std::filesystem::exists(history_file)) {
-        read_history(history_file.c_str());
-    }
+    read_history(history_file.c_str());
 
     /* detect interactive */
     bool interactive = isatty(STDIN_FILENO);
@@ -365,7 +333,7 @@ int main(int argc, char* argv[]) {
             for (int i = 1; i < argc; ++i) {
                 std::string command = argv[i];
                 if (command.empty()) continue;
-                if (command[0] == '-') continue; /* skip options */
+                if (command[0] == '-') continue;
 
                 if (command == "\\q") break;
                 if (command.rfind("echo ", 0) == 0) {
@@ -407,7 +375,7 @@ int main(int argc, char* argv[]) {
                     perror("fork");
                 }
             }
-            // do NOT exit here — tests expect kubsh to be a running process (VFS emulation)
+            // don't exit: tests expect kubsh process to stay alive, so fall through to main loop
         }
     }
 
@@ -418,110 +386,101 @@ int main(int argc, char* argv[]) {
             reload_config = 0;
         }
 
-        char* line = nullptr;
         if (interactive) {
-            line = readline("$ ");
-        } else {
-            // No stdin input: sleep a bit (keeps process alive and avoids busy loop)
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            continue;
-        }
-
-        if (!line) continue;
-        std::string command = line;
-
-        if (!command.empty()) {
-            add_history(line);
-            write_history(history_file.c_str());
-            std::ofstream h(history_file, std::ios::app);
-            if (h.is_open()) h << command << std::endl;
-        }
-
-        free(line);
-
-        if (command.empty()) continue;
-
-        /* builtins */
-        if (command == "\\q") break;
-
-        if (command.rfind("debug ", 0) == 0) {
-            std::string arg = command.substr(6);
-            if (arg.size() >= 2 && arg.front() == '\'' && arg.back() == '\'') {
-                arg = arg.substr(1, arg.size() - 2);
+            char* line = readline("$ ");
+            if (!line) continue;
+            std::string command(line);
+            if (!command.empty()) {
+                add_history(line);
+                write_history(history_file.c_str());
+                std::ofstream h(history_file, std::ios::app);
+                if (h.is_open()) h << command << std::endl;
             }
-            std::cout << arg << std::endl;
-            continue;
-        }
+            free(line);
 
-        if (command.rfind("echo ", 0) == 0) {
-            std::cout << command.substr(5) << std::endl;
-            continue;
-        }
+            if (command.empty()) continue;
 
-        if (command.rfind("\\e $", 0) == 0) {
-            std::string env_var = command.substr(4);
-            if (env_var == "PATH") print_env_list("PATH");
-            else {
-                char* v = getenv(env_var.c_str());
-                if (v) std::cout << v << std::endl;
-            }
-            continue;
-        }
+            if (command == "\\q") break;
 
-        if (command.rfind("\\l ", 0) == 0) {
-            list_partitions(command.substr(3));
-            continue;
-        }
-
-        auto tokens = split(command);
-        if (tokens.empty()) continue;
-
-        if (tokens[0] == "cd") {
-            if (tokens.size() == 1) {
-                const char* home = getenv("HOME");
-                if (home) chdir(home);
-                else {
-                    struct passwd* pw = getpwuid(getuid());
-                    if (pw) chdir(pw->pw_dir);
+            if (command.rfind("debug ", 0) == 0) {
+                std::string arg = command.substr(6);
+                if (arg.size() >= 2 && arg.front() == '\'' && arg.back() == '\'') {
+                    arg = arg.substr(1, arg.size() - 2);
                 }
-            } else {
-                if (chdir(tokens[1].c_str()) != 0) perror("cd");
+                std::cout << arg << std::endl;
+                continue;
             }
-            continue;
-        }
 
-        /* external commands */
-        std::string exe = find_executable(tokens[0]);
-        if (exe.empty()) {
-            std::cout << tokens[0] << ": command not found" << std::endl;
-            continue;
-        }
+            if (command.rfind("echo ", 0) == 0) {
+                std::cout << command.substr(5) << std::endl;
+                continue;
+            }
 
-        std::vector<char*> args;
-        for (auto &s : tokens) args.push_back(const_cast<char*>(s.c_str()));
-        args.push_back(nullptr);
+            if (command.rfind("\\e $", 0) == 0) {
+                std::string env_var = command.substr(4);
+                if (env_var == "PATH") print_env_list("PATH");
+                else {
+                    char* v = getenv(env_var.c_str());
+                    if (v) std::cout << v << std::endl;
+                }
+                continue;
+            }
 
-        pid_t pid = fork();
-        if (pid == 0) {
-            execve(exe.c_str(), args.data(), environ);
-            perror("execve");
-            _exit(127);
-        } else if (pid > 0) {
-            int status = 0;
-            waitpid(pid, &status, 0);
+            if (command.rfind("\\l ", 0) == 0) {
+                list_partitions(command.substr(3));
+                continue;
+            }
+
+            auto tokens = split(command);
+            if (tokens.empty()) continue;
+
+            if (tokens[0] == "cd") {
+                if (tokens.size() == 1) {
+                    const char* home = getenv("HOME");
+                    if (home) chdir(home);
+                    else {
+                        struct passwd* pw = getpwuid(getuid());
+                        if (pw) chdir(pw->pw_dir);
+                    }
+                } else {
+                    if (chdir(tokens[1].c_str()) != 0) perror("cd");
+                }
+                continue;
+            }
+
+            std::string exe = find_executable(tokens[0]);
+            if (exe.empty()) {
+                std::cout << tokens[0] << ": command not found" << std::endl;
+                continue;
+            }
+
+            std::vector<char*> args;
+            for (auto &s : tokens) args.push_back(const_cast<char*>(s.c_str()));
+            args.push_back(nullptr);
+
+            pid_t pid = fork();
+            if (pid == 0) {
+                execve(exe.c_str(), args.data(), environ);
+                perror("execve");
+                _exit(127);
+            }
+            if (pid > 0) {
+                int status = 0;
+                waitpid(pid, &status, 0);
+            } else {
+                perror("fork");
+            }
         } else {
-            perror("fork");
+            // non-interactive: just sleep — keep process alive for tests
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     }
 
     /* shutdown */
     running.store(false);
-    if (test_mode) {
-        if (test_vfs_thread.joinable()) {
-            // politely wait a tiny bit for thread to notice running==false
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            test_vfs_thread.detach();
-        }
+    if (test_vfs_thread.joinable()) {
+        // detach / let OS cleanup — tests stop kubsh by terminating process
+        test_vfs_thread.detach();
     }
 
     cleanup();
