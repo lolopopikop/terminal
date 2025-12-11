@@ -65,7 +65,7 @@ jobs:
 
       - name: Create symlink for kubsh inside tests folder
         working-directory: tests
-        run: ln -s /usr/local/bin/kubsh kubsh --test
+        run: ln -s /usr/local/bin/kubsh kubsh
 
       - name: Run pytest
         working-directory: tests
