@@ -124,24 +124,31 @@ int main(int argc, char* argv[]) {
     }
     
     // В тестовом режиме даем больше времени на монтирование
-    int vfs_startup_delay = test_mode ? 100 : 300;
-    
-    // Запускаем VFS если не отключено
-    if (auto_vfs) {
-        // Создаем каталог если не существует
-        mkdir("users", 0755);
+int vfs_startup_delay = test_mode ? 100 : 300;
+
+// В тестовом режиме GitHub Actions нужно отключить FUSE
+if (test_mode) {
+    std::cout << "TEST MODE: VFS is disabled\n";
+    auto_vfs = false;
+}
+
+// Запускаем VFS если не отключено
+if (auto_vfs) {
+    // Создаем каталог если не существует
+    mkdir("users", 0755);
         
-        // Запускаем VFS в отдельном потоке
-        std::thread vfs_thread([]() {
-            if (start_users_vfs("users") != 0) {
-                std::cerr << "Warning: Failed to start VFS" << std::endl;
-            }
-        });
-        vfs_thread.detach();
+    // Запускаем VFS в отдельном потоке
+    std::thread vfs_thread([]() {
+        if (start_users_vfs("users") != 0) {
+            std::cerr << "Warning: Failed to start VFS" << std::endl;
+        }
+    });
+    vfs_thread.detach();
         
-        // Даем время на монтирование (больше для тестов!)
-        std::this_thread::sleep_for(std::chrono::milliseconds(vfs_startup_delay));
-    }
+    // Даем время на монтирование (больше для тестов!)
+    std::this_thread::sleep_for(std::chrono::milliseconds(vfs_startup_delay));
+}
+
     
     // Загружаем историю команд
     std::string history_file = get_history_file();
