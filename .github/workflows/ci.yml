@@ -7,16 +7,14 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-            - name: Install dependencies (system)
+      - name: Install dependencies (system)
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev gcc g++ libreadline-dev libreadline8
-
 
       - name: Build kubsh
         run: make
@@ -30,7 +28,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     needs: build
-
     steps:
       - name: Checkout kubsh repo
         uses: actions/checkout@v4
@@ -41,17 +38,5 @@ jobs:
           name: kubsh
           path: .
 
-      - name: Install system deps
-        run: |
-          sudo apt update
-          sudo apt install -y fuse3 libfuse3-dev gcc g++ python3-pip
-
-      - name: Clone tests repo
-        run: |
-          git clone https://github.com/lolopopikop/tests.git tests
-
-      - name: Install pytest
-        run: pip install pytest
-
-      - name: Run tests
-        run: pytest tests/
+      - name: Run kubsh test
+        run: chmod +x ./kubsh && ./kubsh --test
