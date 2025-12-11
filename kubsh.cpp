@@ -117,8 +117,8 @@ int main(int argc, char* argv[]) {
 
     // Disable VFS completely in CI
     if (getenv("CI")) {
-        fprintf(stderr, "CI ENV detected — disabling VFS\n");
-        auto_vfs = false;
+        fprintf(stderr, "CI ENV detected — FUSE disabled, VFS active\n");
+        auto_vfs = true;
     }
 
 
