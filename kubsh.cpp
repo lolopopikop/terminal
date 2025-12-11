@@ -115,6 +115,13 @@ int main(int argc, char* argv[]) {
     bool auto_vfs = true;
     bool test_mode = false;
 
+    // Disable VFS completely in CI
+    if (getenv("CI")) {
+        fprintf(stderr, "CI ENV detected — disabling VFS\n");
+        auto_vfs = false;
+    }
+
+
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--no-vfs") == 0) auto_vfs = false;
         else if (strcmp(argv[i], "--test") == 0) test_mode = true;
