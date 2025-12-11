@@ -292,8 +292,32 @@ int start_users_vfs(const char *mount_point) {
         }
         pthread_detach(watcher_thread);
     }
+
+    /* Immediately scan existing directories so tests don't race watcher */
+    DIR *d = opendir(vfs_root);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d))) {
+            if (strcmp(ent->d_name, ".") == 0 ||
+                strcmp(ent->d_name, "..") == 0) continue;
+
+            char candpath[700];
+            snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
+            struct stat st;
+            if (stat(candpath, &st) != 0) continue;
+            if (!S_ISDIR(st.st_mode)) continue;
+
+            if (!system_user_exists(ent->d_name)) {
+                add_user_to_passwd(ent->d_name);
+            }
+            create_vfs_user_files(ent->d_name);
+        }
+        closedir(d);
+    }
+
     return 0;
 }
+
 
 void stop_users_vfs() {
     if (watcher_running) {
