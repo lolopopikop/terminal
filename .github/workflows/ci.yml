@@ -35,6 +35,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 👉 checkout репозитория с тестами
+      - name: Checkout tests repo
+        uses: actions/checkout@v4
+        with:
+          repository: lolopopikop/tests         # ← замени на свой точный репозиторий
+          path: tests                                      # ← тесты будут в ./tests/
+
       - name: Install Python & pytest
         run: |
           sudo apt update
@@ -51,4 +58,4 @@ jobs:
           sudo dpkg -i kubsh_1.0-1_amd64.deb || sudo apt --fix-broken install -y
 
       - name: Run tests
-        run: pytest -v
+        run: pytest tests -v
