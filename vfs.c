@@ -42,53 +42,86 @@ static int system_user_exists(const char *username) {
 }
 
 static void populate_users() {
-
-    // 1) УДАЛЯЕМ ВСЕ НЕСУЩЕСТВУЮЩИЕ СИСТЕМНЫЕ ПОЛЬЗОВАТЕЛЬСКИЕ ДИРЕКТОРИИ
-    DIR *d = opendir(vfs_root);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d))) {
-            if (strcmp(ent->d_name, ".") == 0 ||
-                strcmp(ent->d_name, "..") == 0)
-                continue;
-
-            // ent->d_name — имя директории
-            if (!system_user_exists(ent->d_name)) {
-                char buf[600];
-                snprintf(buf, sizeof(buf), "%s/%s", vfs_root, ent->d_name);
-                rmdir(buf);  // удаляем "левую" директорию
-            }
-        }
-        closedir(d);
-    }
-
-    // 2) ЧИТАЕМ /etc/passwd И СОЗДАЁМ ТОЛЬКО SH-ПОЛЬЗОВАТЕЛЕЙ
     FILE *f = fopen("/etc/passwd", "r");
     if (!f) return;
 
+    // Track system users that have a valid shell
     char line[512];
+    std::set<std::string> system_shell_users;
+
     while (fgets(line, sizeof(line), f)) {
+        char *fields[7];
+        int idx = 0;
 
-        char *shell = strrchr(line, ':');
-        if (!shell) continue;
-        shell++;
+        fields[idx++] = strtok(line, ":");
+        while (idx < 7 && (fields[idx] = strtok(NULL, ":"))) idx++;
 
-        // только shell-пользователи
-        if (!strstr(shell, "sh"))
-            continue;
+        if (idx < 7) continue;
 
-        char *name_end = strchr(line, ':');
-        if (!name_end) continue;
+        const char *name = fields[0];
+        const char *uid  = fields[2];
+        const char *gid  = fields[3];
+        const char *gecos = fields[4];
+        const char *home = fields[5];
+        const char *shell = fields[6];
 
-        *name_end = '\0';
+        // only include valid shell users
+        if (!strstr(shell, "sh")) continue;
 
+        system_shell_users.insert(name);
+
+        // Create directory
         char path[600];
-        snprintf(path, sizeof(path), "%s/%s", vfs_root, line);
+        snprintf(path, sizeof(path), "%s/%s", vfs_root, name);
         ensure_dir(path);
+
+        // Write fields
+        write_file(std::string(path) + "/id", uid);
+        write_file(std::string(path) + "/gid", gid);
+        write_file(std::string(path) + "/name", gecos);
+        write_file(std::string(path) + "/home", home);
+        write_file(std::string(path) + "/shell", shell);
     }
 
     fclose(f);
+
+    // Scan users/ for directories not in /etc/passwd → create user in passwd
+    DIR *d = opendir(vfs_root);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+            continue;
+
+        if (system_shell_users.count(ent->d_name))
+            continue;
+
+        // user exists in VFS but not in passwd → add
+
+        char passwd_entry[512];
+        snprintf(passwd_entry, sizeof(passwd_entry),
+                 "%s:x:10000:10000::/home/%s:/bin/sh\n",
+                 ent->d_name, ent->d_name);
+
+        FILE *pf = fopen("/etc/passwd", "a");
+        if (pf) {
+            fputs(passwd_entry, pf);
+            fclose(pf);
+        }
+
+        // Ensure files exist
+        std::string base = std::string(vfs_root) + "/" + ent->d_name;
+        write_file(base + "/id", "10000");
+        write_file(base + "/gid", "10000");
+        write_file(base + "/name", "");
+        write_file(base + "/home", ("/home/" + std::string(ent->d_name)).c_str());
+        write_file(base + "/shell", "/bin/sh");
+    }
+
+    closedir(d);
 }
+
 
 
 int start_users_vfs(const char *mount_point) {
