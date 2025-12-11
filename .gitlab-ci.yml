@@ -1,0 +1,30 @@
+stages:
+  - build
+  - test
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+
+build:
+  stage: build
+  image: gcc:latest
+  script:
+    - apt update
+    - apt install -y fuse3 libfuse3-dev
+    - make
+  artifacts:
+    paths:
+      - kubsh
+    expire_in: 1 day
+
+test:
+  stage: test
+  image: python:3.13
+  before_script:
+    - apt update
+    - apt install -y fuse3 libfuse3-dev gcc g++
+    - git clone https://github.com/lolopopikop/tests
+    - pip install pytest
+  script:
+    - make
+    - pytest tests/
