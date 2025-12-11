@@ -142,21 +142,25 @@ int main(int argc, char* argv[]) {
     }
 
     /* Start VFS only if allowed (not in test mode) */
+    /* Start VFS only if allowed (not in test mode) */
     if (auto_vfs) {
-        /* create mountpoint directory if missing */
-        mkdir("users", 0755);
+        const char* vfs_dir = getenv("KUBSH_VFS_DIR");
+        if (!vfs_dir) vfs_dir = "users";
 
-        /* spawn VFS in a detached thread so main can continue */
-        std::thread vfs_thread([]() {
-            if (start_users_vfs("users") != 0) {
+        mkdir(vfs_dir, 0755);
+
+        std::string mount_point = vfs_dir;
+
+        std::thread vfs_thread([mount_point]() {
+            if  (start_users_vfs(mount_point.c_str()) != 0) {
                 std::cerr << "Warning: Failed to start users VFS\n";
             }
         });
         vfs_thread.detach();
 
-        /* small sleep to give VFS time to mount (non-blocking) */
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+
 
     /* history */
     std::string history_file = get_history_file();
