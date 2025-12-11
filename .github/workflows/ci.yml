@@ -10,6 +10,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: app
 
       - name: Install system dependencies
         run: |
@@ -17,30 +19,34 @@ jobs:
           sudo apt install -y fuse3 libfuse3-dev gcc g++ libreadline-dev libreadline8 dpkg-dev
 
       - name: Build project
+        working-directory: app
         run: make
 
       - name: Build DEB package
+        working-directory: app
         run: make deb
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
           name: kubsh
-          path: kubsh_1.0-1_amd64.deb
+          path: app/kubsh_1.0-1_amd64.deb
 
   test:
     runs-on: ubuntu-latest
     needs: build
 
     steps:
+      # исходники терминала (куда поставим deb)
       - uses: actions/checkout@v4
-
-      # 👉 checkout репозитория с тестами
-      - name: Checkout tests repo
-        uses: actions/checkout@v4
         with:
-          repository: lolopopikop/tests         # ← замени на свой точный репозиторий
-          path: tests                                      # ← тесты будут в ./tests/
+          path: app
+
+      # тесты отдельно
+      - uses: actions/checkout@v4
+        with:
+          repository: lolopopikop/tests
+          path: tests
 
       - name: Install Python & pytest
         run: |
@@ -52,10 +58,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: kubsh
+          path: app
 
       - name: Install DEB
         run: |
-          sudo dpkg -i kubsh_1.0-1_amd64.deb || sudo apt --fix-broken install -y
+          sudo dpkg -i app/kubsh_1.0-1_amd64.deb || sudo apt --fix-broken install -y
 
       - name: Run tests
-        run: pytest tests -v
+        working-directory: tests
+        run: pytest -v
