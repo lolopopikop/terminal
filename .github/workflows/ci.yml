@@ -12,10 +12,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies (system)
+            - name: Install dependencies (system)
         run: |
           sudo apt update
-          sudo apt install -y fuse3 libfuse3-dev gcc g++
+          sudo apt install -y fuse3 libfuse3-dev gcc g++ libreadline-dev libreadline8
+
 
       - name: Build kubsh
         run: make
