@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "vfs.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,155 +9,288 @@
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
 
-static int vfs_enabled = 1;
 static char vfs_root[512] = {0};
+static pthread_t watcher_thread;
+static int watcher_running = 0;
 
+/* Helpers */
 static int ensure_dir(const char *path) {
     if (mkdir(path, 0755) == -1 && errno != EEXIST) {
-        perror("mkdir");
         return -1;
     }
     return 0;
 }
 
-static void write_file(const char *path, const char *data) {
-    FILE *f = fopen(path, "w");
-    if (!f) return;
-    fprintf(f, "%s", data);
+/* Check if user exists in /etc/passwd */
+static int system_user_exists(const char *username) {
+    FILE *f = fopen("/etc/passwd", "r");
+    if (!f) return 0;
+    char line[1024];
+    size_t un_len = strlen(username);
+    int ok = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, username, un_len) == 0 && line[un_len] == ':') {
+            ok = 1;
+            break;
+        }
+    }
     fclose(f);
+    return ok;
 }
 
-static void populate_users() {
+/* Return max uid found in /etc/passwd (or 1000) */
+static int passwd_max_uid() {
     FILE *f = fopen("/etc/passwd", "r");
-    if (!f) return;
-
-    char line[512];
-    char known_users[256][64];
-    int known_count = 0;
-
+    if (!f) return 1000;
+    char line[1024];
+    int max_uid = 1000;
     while (fgets(line, sizeof(line), f)) {
-        char *fields[7];
-        int idx = 0;
-
-        fields[idx++] = strtok(line, ":");
-        while (idx < 7 && (fields[idx] = strtok(NULL, ":"))) idx++;
-
-        if (idx < 7) continue;
-
-        const char *name  = fields[0];
-        const char *uid   = fields[2];
-        const char *gid   = fields[3];
-        const char *gecos = fields[4];
-        const char *home  = fields[5];
-        const char *shell = fields[6];
-
-        if (!strstr(shell, "sh")) continue;
-
-        strncpy(known_users[known_count++], name, 63);
-
-        char path[600];
-        snprintf(path, sizeof(path), "%s/%s", vfs_root, name);
-        ensure_dir(path);
-
-        char fp[700];
-        snprintf(fp, sizeof(fp), "%s/id", path);   write_file(fp, uid);
-        snprintf(fp, sizeof(fp), "%s/gid", path);  write_file(fp, gid);
-        snprintf(fp, sizeof(fp), "%s/name", path); write_file(fp, gecos);
-        snprintf(fp, sizeof(fp), "%s/home", path); write_file(fp, home);
-        snprintf(fp, sizeof(fp), "%s/shell", path);write_file(fp, shell);
+        // fields: name:passwd:uid:gid:gecos:home:shell
+        char *p = line;
+        // skip name
+        p = strchr(p, ':');
+        if (!p) continue;
+        p++;
+        // skip passwd
+        p = strchr(p, ':');
+        if (!p) continue;
+        p++;
+        // now p points to uid
+        int uid = atoi(p);
+        if (uid > max_uid) max_uid = uid;
     }
-
     fclose(f);
+    return max_uid;
+}
 
-    DIR *d = opendir(vfs_root);
-    if (!d) return;
+/* Append user to /etc/passwd with /bin/bash shell (ends with newline) */
+static int add_user_to_passwd(const char *username) {
+    if (!username || username[0] == '\0') return -1;
+    if (system_user_exists(username)) return 0;
+    int max_uid = passwd_max_uid();
+    int new_uid = max_uid + 1;
+    FILE *f = fopen("/etc/passwd", "a");
+    if (!f) return -1;
+    // format: name:x:uid:gid:gecos:home:shell\n
+    int w = fprintf(f, "%s:x:%d:%d::/home/%s:/bin/bash\n", username, new_uid, new_uid, username);
+    fclose(f);
+    if (w < 0) return -1;
+    // try create home directory (best-effort)
+    char home[512];
+    snprintf(home, sizeof(home), "/home/%s", username);
+    mkdir(home, 0755);
+    return 0;
+}
 
-    struct dirent *ent;
-    while ((ent = readdir(d))) {
-        if (strcmp(ent->d_name, ".") == 0 ||
-            strcmp(ent->d_name, "..") == 0)
-            continue;
+/* Write small file WITHOUT trailing newline (important for tests) */
+static int write_file_no_nl(const char *path, const char *content) {
+    if (!path) return -1;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    ssize_t len = content ? (ssize_t)strlen(content) : 0;
+    ssize_t wrote = 0;
+    while (wrote < len) {
+        ssize_t r = write(fd, content + wrote, len - wrote);
+        if (r <= 0) { close(fd); return -1; }
+        wrote += r;
+    }
+    close(fd);
+    return 0;
+}
 
-        int i, found = 0;
-        for (i = 0; i < known_count; i++) {
-            if (strcmp(known_users[i], ent->d_name) == 0) {
-                found = 1;
+/* Create vfs entry for a username: create dir and id/home/shell files */
+static void create_vfs_user_files(const char *username) {
+    char path[600];
+    snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
+    ensure_dir(path);
+
+    // find uid from /etc/passwd (new value)
+    int uid = 0;
+    FILE *f = fopen("/etc/passwd", "r");
+    if (f) {
+        char line[1024];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, username, strlen(username)) == 0 && line[strlen(username)] == ':') {
+                // parse uid: name:pw:uid:...
+                char *p = line;
+                p = strchr(p, ':'); if (!p) break; p++;
+                p = strchr(p, ':'); if (!p) break; p++;
+                uid = atoi(p);
                 break;
             }
         }
-
-        if (found) continue;
-
-        FILE *pf = fopen("/etc/passwd", "a");
-        if (pf) {
-            fprintf(pf, "%s:x:10000:10000::/home/%s:/bin/sh\n",
-                    ent->d_name, ent->d_name);
-            fclose(pf);
-        }
-
-        char base[600];
-        snprintf(base, sizeof(base), "%s/%s", vfs_root, ent->d_name);
-
-        char fp[700];
-        snprintf(fp, sizeof(fp), "%s/id", base);      write_file(fp, "10000");
-        snprintf(fp, sizeof(fp), "%s/gid", base);     write_file(fp, "10000");
-        snprintf(fp, sizeof(fp), "%s/name", base);    write_file(fp, "");
-        snprintf(fp, sizeof(fp), "%s/home", base);    write_file(fp, "/home/");
-        snprintf(fp, sizeof(fp), "%s/shell", base);   write_file(fp, "/bin/sh");
+        fclose(f);
     }
+    char idbuf[32];
+    snprintf(idbuf, sizeof(idbuf), "%d", uid);
+    char idpath[700], homepath[700], shellpath[700];
+    snprintf(idpath, sizeof(idpath), "%s/id", path);
+    snprintf(homepath, sizeof(homepath), "%s/home", path);
+    snprintf(shellpath, sizeof(shellpath), "%s/shell", path);
 
-    closedir(d);
+    write_file_no_nl(idpath, idbuf);
+    // home from /etc/passwd
+    // read home and shell quickly
+    char homebuf[512] = {0};
+    char shellbuf[256] = {0};
+    f = fopen("/etc/passwd", "r");
+    if (f) {
+        char line[1024];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, username, strlen(username)) == 0 && line[strlen(username)] == ':') {
+                // split fields
+                // name:pw:uid:gid:gecos:home:shell
+                char *fields[7] = {0};
+                char *p = line;
+                for (int i = 0; i < 7; ++i) {
+                    fields[i] = p;
+                    char *q = strchr(p, ':');
+                    if (!q) break;
+                    *q = '\0';
+                    p = q + 1;
+                }
+                if (fields[5]) strncpy(homebuf, fields[5], sizeof(homebuf)-1);
+                if (fields[6]) {
+                    // fields[6] may include trailing newline
+                    char *nl = strchr(fields[6], '\n');
+                    if (nl) *nl = '\0';
+                    strncpy(shellbuf, fields[6], sizeof(shellbuf)-1);
+                }
+                break;
+            }
+        }
+        fclose(f);
+    }
+    write_file_no_nl(homepath, homebuf);
+    write_file_no_nl(shellpath, shellbuf);
 }
 
-int start_users_vfs(const char *mount_point) {
-
-    if (getenv("CI")) {
-        printf("---\nCI ENV detected — FUSE disabled, VFS active\n");
-        vfs_enabled = 1;
-        strncpy(vfs_root, mount_point, sizeof(vfs_root)-1);
-        ensure_dir(vfs_root);
-        populate_users();
-        return 0;
+/* Populate users/ from /etc/passwd: only shells containing 'sh' */
+static void populate_users_from_passwd() {
+    ensure_dir(vfs_root);
+    FILE *f = fopen("/etc/passwd", "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        // check shell field
+        char *last_colon = strrchr(line, ':');
+        if (!last_colon) continue;
+        char *shell = last_colon + 1;
+        if (!strstr(shell, "sh")) continue; // only shell users
+        // extract username (before first colon)
+        char *first_colon = strchr(line, ':');
+        if (!first_colon) continue;
+        *first_colon = '\0';
+        const char *username = line;
+        if (username && username[0]) {
+            char path[600];
+            snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
+            ensure_dir(path);
+            // create id/home/shell files (no trailing newline)
+            create_vfs_user_files(username);
+        }
     }
+    fclose(f);
+}
 
-    vfs_enabled = 1;
+/* Polling thread: look for new directories inside vfs_root and add to /etc/passwd */
+static void *watcher_fn(void *arg) {
+    (void)arg;
+    while (watcher_running) {
+        DIR *d = opendir(vfs_root);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d))) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                // skip non-directory entries — but some FS types may not set d_type
+                char candpath[700];
+                snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
+                struct stat st;
+                if (stat(candpath, &st) != 0) continue;
+                if (!S_ISDIR(st.st_mode)) continue;
+                if (!system_user_exists(ent->d_name)) {
+                    // add user to /etc/passwd and create files
+                    add_user_to_passwd(ent->d_name);
+                    create_vfs_user_files(ent->d_name);
+                } else {
+                    // ensure files exist (in case they were removed)
+                    create_vfs_user_files(ent->d_name);
+                }
+            }
+            closedir(d);
+        }
+        struct timespec ts = {0, 100 * 1000 * 1000}; // 100ms
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+/* Public API */
+
+int start_users_vfs(const char *mount_point) {
+    if (!mount_point) return -1;
     strncpy(vfs_root, mount_point, sizeof(vfs_root)-1);
     ensure_dir(vfs_root);
+    populate_users_from_passwd();
 
-    populate_users();
+    // start watcher thread if not already
+    if (!watcher_running) {
+        watcher_running = 1;
+        if (pthread_create(&watcher_thread, NULL, watcher_fn, NULL) != 0) {
+            watcher_running = 0;
+            return -1;
+        }
+        pthread_detach(watcher_thread);
+    }
     return 0;
 }
 
 void stop_users_vfs() {
+    if (watcher_running) {
+        watcher_running = 0;
+        // thread is detached; give it a moment (best-effort)
+        struct timespec ts = {0, 50 * 1000 * 1000};
+        nanosleep(&ts, NULL);
+    }
 }
 
 int vfs_add_user(const char *username) {
-    char path[600];
+    if (!username) return -1;
+    // create the directory (tests call (vfs / username).mkdir(...))
+    char path[700];
     snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
-    return ensure_dir(path);
+    if (ensure_dir(path) != 0) return -1;
+    // also ensure it's in passwd (watcher will eventually add, but do best-effort now)
+    if (!system_user_exists(username)) {
+        add_user_to_passwd(username);
+    }
+    create_vfs_user_files(username);
+    return 0;
 }
 
 int vfs_user_exists(const char *username) {
-    char path[600];
+    char path[700];
     snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
     struct stat st;
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
 void vfs_list_users(void (*callback)(const char *)) {
+    if (!callback) return;
     DIR *d = opendir(vfs_root);
     if (!d) return;
-
     struct dirent *ent;
     while ((ent = readdir(d))) {
-        if (ent->d_type == DT_DIR &&
-            strcmp(ent->d_name, ".") != 0 &&
-            strcmp(ent->d_name, "..") != 0)
-        {
-            callback(ent->d_name);
-        }
+        if (strcmp(ent->d_name, ".") == 0 ||
+            strcmp(ent->d_name, "..") == 0) continue;
+        char candpath[700];
+        snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
+        struct stat st;
+        if (stat(candpath, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) callback(ent->d_name);
     }
-
     closedir(d);
 }
