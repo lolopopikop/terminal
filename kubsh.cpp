@@ -123,14 +123,6 @@ int main(int argc, char* argv[]) {
 
     // В тестовом режиме GitHub Actions нужно отключить FUSE (он запрещён в CI)
     int vfs_startup_delay = test_mode ? 100 : 300;
-    
-    bool interactive = isatty(STDIN_FILENO);
-
-    if (test_mode) {
-        std::cout << "TEST MODE ENABLED\n";
-        interactive = false;   // <── ВАЖНО
-    }
-
 
     // Запуск VFS (только если не тест)
     if (auto_vfs) {
@@ -153,6 +145,14 @@ int main(int argc, char* argv[]) {
     read_history(history_file.c_str());
 
     bool interactive = isatty(STDIN_FILENO);
+
+    if (test_mode) {
+        std::cout << "TEST MODE: forcing non-interactive mode\n";
+        interactive = false;
+    }
+
+
+
     // Если не интерактивный режим и есть команда, выполняем и выходим
     if (!interactive && argc > 1) {
         bool has_real_command = false;
