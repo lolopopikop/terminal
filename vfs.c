@@ -203,76 +203,118 @@ static void *watcher_fn(void *arg) {
     int inotify_fd = -1;
     int wd = -1;
 
-    // try to create inotify instance
+    // create inotify
     inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
     if (inotify_fd >= 0) {
-        wd = inotify_add_watch(inotify_fd, vfs_root, IN_CREATE | IN_MOVED_TO | IN_ONLYDIR);
+        wd = inotify_add_watch(inotify_fd, vfs_root,
+                               IN_CREATE | IN_MOVED_TO | IN_ONLYDIR);
     }
 
     while (watcher_running) {
         int did_work = 0;
 
+        // ---------------------------
+        //   INOTIFY EVENT HANDLING
+        // ---------------------------
         if (inotify_fd >= 0 && wd >= 0) {
             char buf[4096]
                 __attribute__ ((aligned(__alignof__(struct inotify_event))));
+
             ssize_t len = read(inotify_fd, buf, sizeof(buf));
             if (len > 0) {
                 ssize_t i = 0;
                 while (i < len) {
-                    struct inotify_event *ev = (struct inotify_event *)(buf + i);
+                    struct inotify_event *ev =
+                        (struct inotify_event *)(buf + i);
+
                     if (ev->len > 0) {
-                        if ((ev->mask & IN_ISDIR) && (ev->mask & (IN_CREATE | IN_MOVED_TO))) {
-                            // new directory created/moved into vfs_root
+                        if ((ev->mask & IN_ISDIR) &&
+                            (ev->mask & (IN_CREATE | IN_MOVED_TO))) {
+
+                            // new directory = new user
                             if (!system_user_exists(ev->name)) {
                                 add_user_to_passwd(ev->name);
                             }
                             create_vfs_user_files(ev->name);
                         }
-                        // handle other events if needed
                     }
+
                     i += sizeof(struct inotify_event) + ev->len;
                 }
                 did_work = 1;
+
             } else if (len == -1 && errno != EAGAIN) {
-                // if inotify read failed fatally, fall back to poll
+                // inotify failed → disable, switch to full-scan mode
                 close(inotify_fd);
                 inotify_fd = -1;
                 wd = -1;
             }
         }
 
-        // fallback / safety scan (fast): do a single quick directory scan if no inotify events
+        // ---------------------------
+        //  FALLBACK SCAN IF NO EVENT
+        // ---------------------------
         if (!did_work) {
             DIR *d = opendir(vfs_root);
             if (d) {
                 struct dirent *ent;
                 while ((ent = readdir(d))) {
-                    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-                    char candpath[700];
-                    snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
+                    if (strcmp(ent->d_name, ".") == 0 ||
+                        strcmp(ent->d_name, "..") == 0)
+                        continue;
+
+                    char path[700];
+                    snprintf(path, sizeof(path), "%s/%s", vfs_root, ent->d_name);
+
                     struct stat st;
-                    if (stat(candpath, &st) != 0) continue;
+                    if (stat(path, &st) != 0) continue;
                     if (!S_ISDIR(st.st_mode)) continue;
+
                     if (!system_user_exists(ent->d_name)) {
                         add_user_to_passwd(ent->d_name);
-                        create_vfs_user_files(ent->d_name);
-                    } else {
-                        create_vfs_user_files(ent->d_name);
                     }
+                    create_vfs_user_files(ent->d_name);
                 }
                 closedir(d);
-                did_work = 1;
             }
         }
 
-        // sleep briefly: if inotify is active, this iteration will be cheap; if not, keep 100ms
-        struct timespec ts = {0, 100 * 1000 * 1000}; // 100ms
+        // ---------------------------------------------------------
+        //  🔥 ALWAYS-SCAN (ПОБЕДНАЯ ХУЙНЯ, ЧИНИТ TEST_VFS_ADD_USER)
+        // ---------------------------------------------------------
+        {
+            DIR *d2 = opendir(vfs_root);
+            if (d2) {
+                struct dirent *ent2;
+                while ((ent2 = readdir(d2))) {
+                    if (strcmp(ent2->d_name, ".") == 0 ||
+                        strcmp(ent2->d_name, "..") == 0)
+                        continue;
+
+                    char path2[700];
+                    snprintf(path2, sizeof(path2), "%s/%s", vfs_root, ent2->d_name);
+
+                    struct stat st2;
+                    if (stat(path2, &st2) != 0) continue;
+                    if (!S_ISDIR(st2.st_mode)) continue;
+
+                    if (!system_user_exists(ent2->d_name)) {
+                        add_user_to_passwd(ent2->d_name);
+                    }
+                    create_vfs_user_files(ent2->d_name);
+                }
+                closedir(d2);
+            }
+        }
+
+        // sleep 100ms
+        struct timespec ts = {0, 100 * 1000 * 1000};
         nanosleep(&ts, NULL);
     }
 
-    if (inotify_fd >= 0) close(inotify_fd);
     return NULL;
 }
+
 
 /* Public API */
 
