@@ -11,8 +11,6 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <time.h>
-#include <sys/inotify.h>
-#include <limits.h>
 
 static char vfs_root[512] = {0};
 static pthread_t watcher_thread;
@@ -143,7 +141,8 @@ static void create_vfs_user_files(const char *username) {
         char line[1024];
         while (fgets(line, sizeof(line), f)) {
             if (strncmp(line, username, strlen(username)) == 0 && line[strlen(username)] == ':') {
-                // split fields: name:pw:uid:gid:gecos:home:shell
+                // split fields
+                // name:pw:uid:gid:gecos:home:shell
                 char *fields[7] = {0};
                 char *p = line;
                 for (int i = 0; i < 7; ++i) {
@@ -197,80 +196,35 @@ static void populate_users_from_passwd() {
     fclose(f);
 }
 
-/* inotify-based watcher: reacts to IN_CREATE (dirs) and also fallback to polling */
+/* Polling thread: look for new directories inside vfs_root and add to /etc/passwd */
 static void *watcher_fn(void *arg) {
     (void)arg;
-    int inotify_fd = -1;
-    int wd = -1;
-
-    // try to create inotify instance
-    inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (inotify_fd >= 0) {
-        wd = inotify_add_watch(inotify_fd, vfs_root, IN_CREATE | IN_MOVED_TO | IN_ONLYDIR);
-    }
-
     while (watcher_running) {
-        int did_work = 0;
-
-        if (inotify_fd >= 0 && wd >= 0) {
-            char buf[4096]
-                __attribute__ ((aligned(__alignof__(struct inotify_event))));
-            ssize_t len = read(inotify_fd, buf, sizeof(buf));
-            if (len > 0) {
-                ssize_t i = 0;
-                while (i < len) {
-                    struct inotify_event *ev = (struct inotify_event *)(buf + i);
-                    if (ev->len > 0) {
-                        if ((ev->mask & IN_ISDIR) && (ev->mask & (IN_CREATE | IN_MOVED_TO))) {
-                            // new directory created/moved into vfs_root
-                            if (!system_user_exists(ev->name)) {
-                                add_user_to_passwd(ev->name);
-                            }
-                            create_vfs_user_files(ev->name);
-                        }
-                        // handle other events if needed
-                    }
-                    i += sizeof(struct inotify_event) + ev->len;
+        DIR *d = opendir(vfs_root);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d))) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                // skip non-directory entries — but some FS types may not set d_type
+                char candpath[700];
+                snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
+                struct stat st;
+                if (stat(candpath, &st) != 0) continue;
+                if (!S_ISDIR(st.st_mode)) continue;
+                if (!system_user_exists(ent->d_name)) {
+                    // add user to /etc/passwd and create files
+                    add_user_to_passwd(ent->d_name);
+                    create_vfs_user_files(ent->d_name);
+                } else {
+                    // ensure files exist (in case they were removed)
+                    create_vfs_user_files(ent->d_name);
                 }
-                did_work = 1;
-            } else if (len == -1 && errno != EAGAIN) {
-                // if inotify read failed fatally, fall back to poll
-                close(inotify_fd);
-                inotify_fd = -1;
-                wd = -1;
             }
+            closedir(d);
         }
-
-        // fallback / safety scan (fast): do a single quick directory scan if no inotify events
-        if (!did_work) {
-            DIR *d = opendir(vfs_root);
-            if (d) {
-                struct dirent *ent;
-                while ((ent = readdir(d))) {
-                    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-                    char candpath[700];
-                    snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
-                    struct stat st;
-                    if (stat(candpath, &st) != 0) continue;
-                    if (!S_ISDIR(st.st_mode)) continue;
-                    if (!system_user_exists(ent->d_name)) {
-                        add_user_to_passwd(ent->d_name);
-                        create_vfs_user_files(ent->d_name);
-                    } else {
-                        create_vfs_user_files(ent->d_name);
-                    }
-                }
-                closedir(d);
-                did_work = 1;
-            }
-        }
-
-        // sleep briefly: if inotify is active, this iteration will be cheap; if not, keep 100ms
         struct timespec ts = {0, 100 * 1000 * 1000}; // 100ms
         nanosleep(&ts, NULL);
     }
-
-    if (inotify_fd >= 0) close(inotify_fd);
     return NULL;
 }
 
@@ -280,7 +234,6 @@ int start_users_vfs(const char *mount_point) {
     if (!mount_point) return -1;
     strncpy(vfs_root, mount_point, sizeof(vfs_root)-1);
     ensure_dir(vfs_root);
-
     populate_users_from_passwd();
 
     // start watcher thread if not already
@@ -292,32 +245,8 @@ int start_users_vfs(const char *mount_point) {
         }
         pthread_detach(watcher_thread);
     }
-
-    /* Immediately scan existing directories so tests don't race watcher */
-    DIR *d = opendir(vfs_root);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d))) {
-            if (strcmp(ent->d_name, ".") == 0 ||
-                strcmp(ent->d_name, "..") == 0) continue;
-
-            char candpath[700];
-            snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
-            struct stat st;
-            if (stat(candpath, &st) != 0) continue;
-            if (!S_ISDIR(st.st_mode)) continue;
-
-            if (!system_user_exists(ent->d_name)) {
-                add_user_to_passwd(ent->d_name);
-            }
-            create_vfs_user_files(ent->d_name);
-        }
-        closedir(d);
-    }
-
     return 0;
 }
-
 
 void stop_users_vfs() {
     if (watcher_running) {
