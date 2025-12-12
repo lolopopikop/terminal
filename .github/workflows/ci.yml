@@ -15,11 +15,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt update
-          sudo apt install -y fuse3 libfuse3-dev gcc g++ libreadline-dev libreadline8 dpkg-dev
+          sudo apt install -y fuse3 libfuse3-dev gcc g++ libreadline-dev dpkg-dev fakeroot
 
       - name: Clean & Build project
         run: |
-          make clean || true
+          make clean
           make
 
       - name: Build DEB package
@@ -28,7 +28,7 @@ jobs:
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
-          name: kubsh
+          name: kubsh-deb
           path: kubsh_1.0-1_amd64.deb
 
   test:
@@ -38,40 +38,43 @@ jobs:
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
-        with:
-          path: app
 
-      - name: Checkout tests repo
+      - name: Checkout tests
         uses: actions/checkout@v4
         with:
           repository: lolopopikop/tests
           path: tests
 
-      - name: Install Python & pytest
+      - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y python3 python3-pip
+          sudo apt install -y python3 python3-pip fuse3 libfuse3-dev libreadline-dev
           pip install pytest
 
-      - name: Download DEB artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: kubsh
-          path: app
-
-      - name: Install DEB package
+      - name: Build kubsh
         run: |
-          sudo dpkg -i app/kubsh_1.0-1_amd64.deb || sudo apt --fix-broken install -y
+          make clean
+          make
+          chmod +x ./kubsh
 
-      - name: Enable SUID for kubsh
-        run: sudo chmod u+s /usr/local/bin/kubsh
-
-      - name: Create symlink for kubsh inside tests folder
+      - name: Prepare test environment
         working-directory: tests
-        run: ln -s /usr/local/bin/kubsh kubsh
+        run: |
+          # Create symlink to kubsh
+          ln -sf ${{ github.workspace }}/kubsh ./kubsh
+          
+          # Set up CI environment for tests
+          mkdir -p users
+          
+          # Copy /etc/passwd for testing (read-only)
+          sudo cp /etc/passwd ./passwd_copy
+          sudo chmod 644 ./passwd_copy
 
-      - name: Run pytest
+      - name: Run tests
         working-directory: tests
         env:
           CI: true
-        run: pytest -v
+          PATH: ${{ github.workspace }}/tests:$PATH
+        run: |
+          echo "Running tests..."
+          python3 -m pytest -v --tb=short

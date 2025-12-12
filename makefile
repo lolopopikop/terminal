@@ -1,7 +1,7 @@
 CXX = g++
 CC = gcc
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -D_FILE_OFFSET_BITS=64
-CFLAGS = -Wall -Wextra -O2 -D_FILE_OFFSET_BITS=64
+CFLAGS = -Wall -Wextra -O2 -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE
 LDFLAGS = -lreadline -lfuse3 -lstdc++ -lpthread
 TARGET = kubsh
 PACKAGE = kubsh
@@ -22,7 +22,7 @@ vfs.o: vfs.c vfs.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 run: $(TARGET)
-	@echo "Starting kubsh..."
+	@echo "Starting kubsh... (use Ctrl+D or \q to exit)"
 	./$(TARGET)
 
 clean:
@@ -39,7 +39,7 @@ deb: $(TARGET)
 	@echo "Package: $(PACKAGE)" > debian/$(TARGET)/DEBIAN/control
 	@echo "Version: $(VERSION)-1" >> debian/$(TARGET)/DEBIAN/control
 	@echo "Architecture: $(ARCH)" >> debian/$(TARGET)/DEBIAN/control
-	@echo "Maintainer: Student <student@example.com>" >> debian/$(TARGET)/DEBIAN/control
+	@echo "Maintainer: kubsh maintainer <kubsh@example.com>" >> debian/$(TARGET)/DEBIAN/control
 	@echo "Description: Custom shell with VFS support" >> debian/$(TARGET)/DEBIAN/control
 	@echo " A shell implementation with virtual filesystem for user information" >> debian/$(TARGET)/DEBIAN/control
 	
@@ -56,6 +56,6 @@ uninstall:
 
 test:
 	@echo "To run tests, install pytest and run:"
-	@echo "  python3 -m pytest test_basic.py test_vfs.py -v"
-	@echo ""
-	@echo "Note: VFS tests require FUSE3 and may need special setup"
+	@echo "  python3 -m pytest"
+	@echo "Or if test files are in the repo:"
+	@echo "  python3 -m pytest test_basic.py test_vfs.py"
