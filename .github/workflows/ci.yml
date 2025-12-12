@@ -63,6 +63,9 @@ jobs:
         run: |
           sudo dpkg -i app/kubsh_1.0-1_amd64.deb || sudo apt --fix-broken install -y
 
+      - name: Enable SUID for kubsh
+        run: sudo chmod u+s /usr/local/bin/kubsh
+
       - name: Create symlink for kubsh inside tests folder
         working-directory: tests
         run: ln -s /usr/local/bin/kubsh kubsh
