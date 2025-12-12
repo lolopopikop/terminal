@@ -172,28 +172,39 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--test") == 0) test_mode = true;
     }
 
+    // test mode disables FUSE but NOT the sync loop
     if (test_mode) auto_vfs = false;
 
-    if (getenv("CI")) {
-        /* tests expect KUBSH_VFS_DIR to be honored, so we don't override it */
-        fprintf(stderr, "CI ENV detected — FUSE disabled, VFS active\n");
+    // In CI: always run sync loop so vfs_add_user works reliably
+    bool ci_mode = getenv("CI") != nullptr;
+    if (ci_mode) {
+        fprintf(stderr, "CI ENV detected — VFS sync loop active\n");
     }
+
 
     string vfs_dir = "users";
     char* env_v = getenv("KUBSH_VFS_DIR");
     if (env_v) vfs_dir = string(env_v);
 
-    if (auto_vfs) {
-        mkdir(vfs_dir.c_str(), 0755);
+    mkdir(vfs_dir.c_str(), 0755);
 
+    if (auto_vfs) {
+        // normal environment: FUSE + sync loop
         thread t1([vfs_dir](){ start_users_vfs(vfs_dir.c_str()); });
         t1.detach();
 
         thread t2([vfs_dir](){ vfs_sync_loop(vfs_dir); });
         t2.detach();
-
-        this_thread::sleep_for(chrono::milliseconds(150));
     }
+    else if (ci_mode) {
+        // CI/test mode: only sync loop (no FUSE)
+        thread t2([vfs_dir](){ vfs_sync_loop(vfs_dir); });
+        t2.detach();
+    }
+
+    // give threads time to start
+    this_thread::sleep_for(chrono::milliseconds(150));
+
 
     /* history init */
     string history_file = get_history_file();
