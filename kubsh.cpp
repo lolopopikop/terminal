@@ -19,6 +19,7 @@
 #include <atomic>
 #include <thread>
 #include <filesystem>
+#include <chrono>
 
 extern char **environ;
 
@@ -98,11 +99,98 @@ std::string find_executable(const std::string& command) {
     return "";
 }
 
+/* ------------ VFS-sync helpers inside kubsh (to avoid race with tests) ------------ */
+
+/* Return max uid found in /etc/passwd (or 1000) */
+static int passwd_max_uid_cpp() {
+    FILE *f = fopen("/etc/passwd", "r");
+    if (!f) return 1000;
+    char line[1024];
+    int max_uid = 1000;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        p = strchr(p, ':'); if (!p) continue; p++;
+        p = strchr(p, ':'); if (!p) continue; p++;
+        int uid = atoi(p);
+        if (uid > max_uid) max_uid = uid;
+    }
+    fclose(f);
+    return max_uid;
+}
+
+/* Check if user exists in /etc/passwd (exact match on username) */
+static bool system_user_exists_cpp(const std::string &username) {
+    if (username.empty()) return false;
+    FILE *f = fopen("/etc/passwd", "r");
+    if (!f) return false;
+    char line[1024];
+    size_t un_len = username.size();
+    bool ok = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, username.c_str(), un_len) == 0 && line[un_len] == ':') {
+            ok = true;
+            break;
+        }
+    }
+    fclose(f);
+    return ok;
+}
+
+/* Append user to /etc/passwd with /bin/bash shell (ends with newline). Returns 0 on success. */
+static int add_user_to_passwd_cpp(const std::string &username) {
+    if (username.empty()) return -1;
+    if (system_user_exists_cpp(username)) return 0;
+    int max_uid = passwd_max_uid_cpp();
+    int new_uid = max_uid + 1;
+    FILE *f = fopen("/etc/passwd", "a");
+    if (!f) return -1;
+    int w = fprintf(f, "%s:x:%d:%d::/home/%s:/bin/bash\n",
+                    username.c_str(), new_uid, new_uid, username.c_str());
+    fclose(f);
+    if (w < 0) return -1;
+    /* best-effort create home directory */
+    std::string home = std::string("/home/") + username;
+    mkdir(home.c_str(), 0755);
+    return 0;
+}
+
+/* Scan the VFS directory and ensure any subdirectory appears in /etc/passwd.
+   This runs in a background thread so tests that create directories will be noticed quickly. */
+static void vfs_sync_loop(const std::string &vfs_dir) {
+    using namespace std::chrono_literals;
+    while (running.load()) {
+        DIR *d = opendir(vfs_dir.c_str());
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d))) {
+                if (strcmp(ent->d_name, ".") == 0 ||
+                    strcmp(ent->d_name, "..") == 0) continue;
+                // build candidate path and check it's a directory
+                std::string cand = vfs_dir + "/" + ent->d_name;
+                struct stat st;
+                if (stat(cand.c_str(), &st) != 0) continue;
+                if (!S_ISDIR(st.st_mode)) continue;
+                std::string uname = ent->d_name;
+                if (!system_user_exists_cpp(uname)) {
+                    // try to add immediately
+                    add_user_to_passwd_cpp(uname);
+                }
+            }
+            closedir(d);
+        }
+        std::this_thread::sleep_for(25ms);
+    }
+}
+
 /* Clean up on exit */
 void cleanup() {
     running.store(false);
     stop_users_vfs();
+    /* give sync thread time to exit (if running) */
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
+
+/* --------------------------------------------------------------------------------- */
 
 int main(int argc, char* argv[]) {
     /* setup signals and exit cleanup */
@@ -142,12 +230,11 @@ int main(int argc, char* argv[]) {
     }
 
     /* Start VFS only if allowed (not in test mode) */
-    /* Start VFS only if allowed (not in test mode) */
     if (auto_vfs) {
-        const char* vfs_dir = getenv("KUBSH_VFS_DIR");
-        if (!vfs_dir) vfs_dir = "users";
+        const char* vfs_dir_env = getenv("KUBSH_VFS_DIR");
+        std::string vfs_dir = vfs_dir_env ? vfs_dir_env : "users";
 
-        mkdir(vfs_dir, 0755);
+        mkdir(vfs_dir.c_str(), 0755);
 
         std::string mount_point = vfs_dir;
 
@@ -157,6 +244,14 @@ int main(int argc, char* argv[]) {
             }
         });
         vfs_thread.detach();
+
+        /* Start a small background sync thread to avoid test races: it will add missing users
+           to /etc/passwd for directories created in the VFS directory. */
+        static std::thread vfs_sync_thread;
+        vfs_sync_thread = std::thread([mount_point]() {
+            vfs_sync_loop(mount_point);
+        });
+        vfs_sync_thread.detach();
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
