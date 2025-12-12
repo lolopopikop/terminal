@@ -5,47 +5,6 @@ on:
   pull_request:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout project
-        uses: actions/checkout@v4
-
-      - name: Checkout tests
-        uses: actions/checkout@v4
-        with:
-          repository: lolopopikop/tests
-          path: tests
-
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y gcc g++ make libfuse3-dev libreadline-dev python3 python3-pip
-          pip3 install pytest
-
-      - name: Build kubsh
-        run: |
-          make clean
-          make
-          chmod +x ./kubsh
-
-      - name: Run tests
-        working-directory: tests
-        env:
-          CI: true
-        run: |
-          # Create symlink to kubsh
-          ln -sf ../kubsh ./kubsh
-          
-          # Run tests
-          python3 -m pytest -vname: CI
-
-on:
-  push:
-  pull_request:
-
-jobs:
   build:
     runs-on: ubuntu-latest
 
