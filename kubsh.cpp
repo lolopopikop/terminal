@@ -26,13 +26,13 @@ extern "C" {
 #include "vfs.h"
 }
 
-// Forward declaration of the new function in vfs.c
-extern "C" void vfs_set_root(const char*);
-
 using namespace std;
 
 volatile sig_atomic_t reload_config = 0;
 std::atomic<bool> running(true);
+
+// Forward declaration of the new function in vfs.c
+extern "C" void vfs_set_root(const char*);
 
 void sighup_handler(int /*sig*/) {
     const char msg[] = "Configuration reloaded\n";
@@ -55,60 +55,51 @@ static vector<string> split_ws(const string &s) {
     return out;
 }
 
-static string strip_quotes(const string &s) {
-    if (s.size() >= 2 &&
-       ((s.front() == '"' && s.back() == '"') ||
-        (s.front()=='\'' && s.back()=='\'')))
-        return s.substr(1, s.size()-2);
-    return s;
+// Implement the missing functions
+string get_history_file() {
+    // You can customize the path as per your needs
+    return "/home/username/.kubsh_history";  // Replace with the actual user home path if necessary
 }
 
-static string find_executable(const string& command) {
-    if (command.empty()) return "";
-    char* path_env = getenv("PATH");
-    if (!path_env) return "";
-    string path_str = path_env;
-    string dir;
-    stringstream ss(path_str);
-    while (getline(ss, dir, ':')) {
-        string full = dir + "/" + command;
-        if (access(full.c_str(), X_OK) == 0) return full;
+void do_debug(const string &line) {
+    cout << "Debugging: " << line << endl;
+}
+
+void do_echo(const string &line) {
+    string rest = trim(line.substr(5));
+    cout << rest << endl;
+}
+
+void do_env(const string &line) {
+    string rest = trim(line.substr(3));
+    if (rest.empty() || rest[0] != '$') {
+        cout << "\\e: command not found" << endl;
+        return;
     }
-    return "";
-}
-
-static void vfs_sync_loop(const string &vfs_dir) {
-    using namespace std::chrono_literals;
-    while (running.load()) {
-        DIR *d = opendir(vfs_dir.c_str());
-        if (d) {
-            struct dirent *ent;
-            while ((ent = readdir(d))) {
-                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-                string cand = vfs_dir + "/" + ent->d_name;
-                struct stat st;
-                if (stat(cand.c_str(), &st) != 0) continue;
-                if (!S_ISDIR(st.st_mode)) continue;
-
-                vfs_add_user(ent->d_name); // Call to add user in VFS
-            }
-            closedir(d);
-        }
-        this_thread::sleep_for(25ms);
+    const char* val = getenv(rest.c_str() + 1);
+    if (val) {
+        cout << val << endl;
     }
 }
 
-void cleanup() {
-    running.store(false);
-    stop_users_vfs();
-    this_thread::sleep_for(std::chrono::milliseconds(50));
+void do_list(const string &line) {
+    string rest = trim(line.substr(3));
+    if (rest.empty()) {
+        cout << "\\l: missing argument" << endl;
+        return;
+    }
+    system(("lsblk " + rest).c_str());
 }
 
 int main(int argc, char* argv[]) {
     signal(SIGHUP, sighup_handler);
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
-    atexit(cleanup);
+    atexit([]() {
+        running.store(false);
+        stop_users_vfs();
+        this_thread::sleep_for(std::chrono::milliseconds(50));
+    });
 
     bool auto_vfs = true;
     bool test_mode = false;
