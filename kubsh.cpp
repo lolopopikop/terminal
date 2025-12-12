@@ -1,4 +1,3 @@
-// kubsh.cpp
 #include <iostream>
 #include <string>
 #include <fstream>
@@ -37,6 +36,7 @@ std::atomic<bool> running(true);
 
 void sighup_handler(int /*sig*/) {
     const char msg[] = "Configuration reloaded\n";
+    /* write is async-signal-safe */
     write(STDOUT_FILENO, msg, sizeof(msg) - 1);
     reload_config = 1;
 }
@@ -137,7 +137,7 @@ static void vfs_sync_loop(const string &vfs_dir) {
                 if (stat(cand.c_str(), &st) != 0) continue;
                 if (!S_ISDIR(st.st_mode)) continue;
 
-                vfs_add_user(ent->d_name);
+                vfs_add_user(ent->d_name); // Call to add user in VFS
             }
             closedir(d);
         }
@@ -178,7 +178,7 @@ int main(int argc, char* argv[]) {
 
     mkdir(vfs_dir.c_str(), 0755);
 
-    // ⭐ FIX: always set VFS root
+    // Set the root for VFS
     vfs_set_root(vfs_dir.c_str());
 
     if (auto_vfs) {
