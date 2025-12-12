@@ -118,6 +118,7 @@ int main(int argc, char* argv[]) {
             auto_vfs = false;
         } else if (strcmp(argv[i], "--test") == 0) {
             test_mode = true;
+            auto_vfs = false; // Disable VFS in test mode
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             command_to_execute = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -174,6 +175,11 @@ int main(int argc, char* argv[]) {
                 if (tokens.size() > 1) {
                     if (chdir(tokens[1].c_str()) != 0) {
                         perror("cd");
+                    }
+                } else {
+                    const char* home = getenv("HOME");
+                    if (home) {
+                        int unused __attribute__((unused)) = chdir(home);
                     }
                 }
                 return 0;
@@ -291,7 +297,9 @@ int main(int argc, char* argv[]) {
                 }
             } else {
                 const char* home = getenv("HOME");
-                if (home) chdir(home);
+                if (home) {
+                    int unused __attribute__((unused)) = chdir(home);
+                }
             }
             continue;
         }
