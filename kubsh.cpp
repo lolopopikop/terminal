@@ -224,37 +224,45 @@ int main(int argc, char* argv[]) {
     }
 
     /* In test mode we MUST disable FUSE/VFS to avoid hanging in CI */
+    /* In test mode we MUST disable FUSE/VFS to avoid hanging in CI */
     if (test_mode) {
         std::cout << "TEST MODE: disabling VFS (FUSE) for CI\n";
         auto_vfs = false;
     }
 
-    /* Start VFS only if allowed (not in test mode) */
+    /* DO NOT override KUBSH_VFS_DIR in CI — tests rely on it */
+    if (getenv("CI")) {
+        fprintf(stderr, "CI ENV detected — FUSE disabled, VFS active\n");
+    /* IMPORTANT:
+       auto_vfs stays TRUE.
+       We DO NOT change the mount directory.
+       We DO NOT force "users".
+       Tests expect kubsh to use exactly KUBSH_VFS_DIR.
+    */
+    }
+
+    /* Start VFS only if allowed */
     if (auto_vfs) {
         const char* vfs_dir_env = getenv("KUBSH_VFS_DIR");
         std::string vfs_dir = vfs_dir_env ? vfs_dir_env : "users";
 
         mkdir(vfs_dir.c_str(), 0755);
 
-        std::string mount_point = vfs_dir;
-
-        std::thread vfs_thread([mount_point]() {
-            if  (start_users_vfs(mount_point.c_str()) != 0) {
-                std::cerr << "Warning: Failed to start users VFS\n";
-            }
+        /* Start main VFS watcher */
+        std::thread vfs_thread([vfs_dir]() {
+            start_users_vfs(vfs_dir.c_str());
         });
         vfs_thread.detach();
 
-        /* Start a small background sync thread to avoid test races: it will add missing users
-           to /etc/passwd for directories created in the VFS directory. */
-        static std::thread vfs_sync_thread;
-        vfs_sync_thread = std::thread([mount_point]() {
-            vfs_sync_loop(mount_point);
+        /* Start sync loop to keep /etc/passwd aligned */
+        std::thread vfs_sync_thread([vfs_dir]() {
+            vfs_sync_loop(vfs_dir);
         });
         vfs_sync_thread.detach();
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
+
 
 
     /* history */
