@@ -283,17 +283,7 @@ int start_users_vfs(const char *mount_point) {
 
     populate_users_from_passwd();
 
-    // start watcher thread if not already
-    if (!watcher_running) {
-        watcher_running = 1;
-        if (pthread_create(&watcher_thread, NULL, watcher_fn, NULL) != 0) {
-            watcher_running = 0;
-            return -1;
-        }
-        pthread_detach(watcher_thread);
-    }
-
-    /* Immediately scan existing directories so tests don't race watcher */
+    /* <<< ВСТАВИТЬ ВОТ СЮДА >>> */
     DIR *d = opendir(vfs_root);
     if (d) {
         struct dirent *ent;
@@ -315,8 +305,18 @@ int start_users_vfs(const char *mount_point) {
         closedir(d);
     }
 
+    if (!watcher_running) {
+        watcher_running = 1;
+        if (pthread_create(&watcher_thread, NULL, watcher_fn, NULL) != 0) {
+            watcher_running = 0;
+            return -1;
+        }
+        pthread_detach(watcher_thread);
+    }
+
     return 0;
 }
+
 
 
 void stop_users_vfs() {
