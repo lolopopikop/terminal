@@ -101,24 +101,7 @@ std::string find_executable(const std::string& command) {
 
 /* ------------ VFS-sync helpers inside kubsh (to avoid race with tests) ------------ */
 
-/* Return max uid found in /etc/passwd (or 1000) */
-static int passwd_max_uid_cpp() {
-    FILE *f = fopen("/etc/passwd", "r");
-    if (!f) return 1000;
-    char line[1024];
-    int max_uid = 1000;
-    while (fgets(line, sizeof(line), f)) {
-        char *p = line;
-        p = strchr(p, ':'); if (!p) continue; p++;
-        p = strchr(p, ':'); if (!p) continue; p++;
-        int uid = atoi(p);
-        if (uid > max_uid) max_uid = uid;
-    }
-    fclose(f);
-    return max_uid;
-}
-
-/* Check if user exists in /etc/passwd (exact match on username) */
+/* Check if user exists in /etc/passwd (exact match on username) - small helper used only here */
 static bool system_user_exists_cpp(const std::string &username) {
     if (username.empty()) return false;
     FILE *f = fopen("/etc/passwd", "r");
@@ -136,26 +119,9 @@ static bool system_user_exists_cpp(const std::string &username) {
     return ok;
 }
 
-/* Append user to /etc/passwd with /bin/bash shell (ends with newline). Returns 0 on success. */
-static int add_user_to_passwd_cpp(const std::string &username) {
-    if (username.empty()) return -1;
-    if (system_user_exists_cpp(username)) return 0;
-    int max_uid = passwd_max_uid_cpp();
-    int new_uid = max_uid + 1;
-    FILE *f = fopen("/etc/passwd", "a");
-    if (!f) return -1;
-    int w = fprintf(f, "%s:x:%d:%d::/home/%s:/bin/bash\n",
-                    username.c_str(), new_uid, new_uid, username.c_str());
-    fclose(f);
-    if (w < 0) return -1;
-    /* best-effort create home directory */
-    std::string home = std::string("/home/") + username;
-    mkdir(home.c_str(), 0755);
-    return 0;
-}
-
 /* Scan the VFS directory and ensure any subdirectory appears in /etc/passwd.
-   This runs in a background thread so tests that create directories will be noticed quickly. */
+   This runs in a background thread so tests that create directories will be noticed quickly.
+   IMPORTANT: call public vfs_add_user() so vfs.c creates the id/home/shell files too. */
 static void vfs_sync_loop(const std::string &vfs_dir) {
     using namespace std::chrono_literals;
     while (running.load()) {
@@ -171,10 +137,9 @@ static void vfs_sync_loop(const std::string &vfs_dir) {
                 if (stat(cand.c_str(), &st) != 0) continue;
                 if (!S_ISDIR(st.st_mode)) continue;
                 std::string uname = ent->d_name;
-                if (!system_user_exists_cpp(uname)) {
-                    // try to add immediately
-                    add_user_to_passwd_cpp(uname);
-                }
+                // call public API to ensure both /etc/passwd and vfs files are created.
+                // vfs_add_user is idempotent and returns quickly if already present.
+                vfs_add_user(uname.c_str());
             }
             closedir(d);
         }
@@ -203,12 +168,11 @@ int main(int argc, char* argv[]) {
     bool auto_vfs = true;
     bool test_mode = false;
 
-    // Disable VFS completely in CI
+    // Detect CI
     if (getenv("CI")) {
         fprintf(stderr, "CI ENV detected — FUSE disabled, VFS active\n");
         auto_vfs = true;
     }
-
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--no-vfs") == 0) auto_vfs = false;
@@ -224,7 +188,6 @@ int main(int argc, char* argv[]) {
     }
 
     /* In test mode we MUST disable FUSE/VFS to avoid hanging in CI */
-    /* In test mode we MUST disable FUSE/VFS to avoid hanging in CI */
     if (test_mode) {
         std::cout << "TEST MODE: disabling VFS (FUSE) for CI\n";
         auto_vfs = false;
@@ -233,12 +196,6 @@ int main(int argc, char* argv[]) {
     /* DO NOT override KUBSH_VFS_DIR in CI — tests rely on it */
     if (getenv("CI")) {
         fprintf(stderr, "CI ENV detected — FUSE disabled, VFS active\n");
-    /* IMPORTANT:
-       auto_vfs stays TRUE.
-       We DO NOT change the mount directory.
-       We DO NOT force "users".
-       Tests expect kubsh to use exactly KUBSH_VFS_DIR.
-    */
     }
 
     /* Start VFS only if allowed */
@@ -248,22 +205,21 @@ int main(int argc, char* argv[]) {
 
         mkdir(vfs_dir.c_str(), 0755);
 
-        /* Start main VFS watcher */
+        /* Start main VFS watcher in vfs.c */
         std::thread vfs_thread([vfs_dir]() {
             start_users_vfs(vfs_dir.c_str());
         });
         vfs_thread.detach();
 
-        /* Start sync loop to keep /etc/passwd aligned */
+        /* Start sync loop to keep /etc/passwd aligned and to avoid race with tests */
         std::thread vfs_sync_thread([vfs_dir]() {
             vfs_sync_loop(vfs_dir);
         });
         vfs_sync_thread.detach();
 
+        /* small initial sleep so background threads have a moment to start */
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-
-
 
     /* history */
     std::string history_file = get_history_file();
