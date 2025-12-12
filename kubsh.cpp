@@ -31,7 +31,7 @@ std::atomic<bool> running(true);
 /* Signal handler */
 void sighup_handler(int /*sig*/) {
     const char msg[] = "Configuration reloaded\n";
-    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+    ssize_t unused __attribute__((unused)) = write(STDOUT_FILENO, msg, sizeof(msg) - 1);
     reload_config = 1;
 }
 
@@ -70,7 +70,7 @@ void print_env_list(const std::string& env_var) {
 
 void list_partitions(const std::string& device) {
     std::string cmd = "lsblk " + device;
-    system(cmd.c_str());
+    int unused __attribute__((unused)) = system(cmd.c_str());
 }
 
 std::string get_history_file() {
