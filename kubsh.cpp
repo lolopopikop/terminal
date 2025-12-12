@@ -34,7 +34,6 @@ std::atomic<bool> running(true);
 /* Signal handler */
 void sighup_handler(int /*sig*/) {
     const char msg[] = "Configuration reloaded\n";
-    /* write is async-signal-safe */
     write(STDOUT_FILENO, msg, sizeof(msg) - 1);
     reload_config = 1;
 }
@@ -99,9 +98,7 @@ std::string find_executable(const std::string& command) {
     return "";
 }
 
-/* ------------ VFS-sync helpers inside kubsh (to avoid race with tests) ------------ */
-
-/* Check if user exists in /etc/passwd (exact match on username) - small helper used only here */
+/* --- VFS SYNC LOOP --- */
 static bool system_user_exists_cpp(const std::string &username) {
     if (username.empty()) return false;
     FILE *f = fopen("/etc/passwd", "r");
@@ -119,9 +116,6 @@ static bool system_user_exists_cpp(const std::string &username) {
     return ok;
 }
 
-/* Scan the VFS directory and ensure any subdirectory appears in /etc/passwd.
-   This runs in a background thread so tests that create directories will be noticed quickly.
-   IMPORTANT: call public vfs_add_user() so vfs.c creates the id/home/shell files too. */
 static void vfs_sync_loop(const std::string &vfs_dir) {
     using namespace std::chrono_literals;
     while (running.load()) {
@@ -131,14 +125,13 @@ static void vfs_sync_loop(const std::string &vfs_dir) {
             while ((ent = readdir(d))) {
                 if (strcmp(ent->d_name, ".") == 0 ||
                     strcmp(ent->d_name, "..") == 0) continue;
-                // build candidate path and check it's a directory
+
                 std::string cand = vfs_dir + "/" + ent->d_name;
                 struct stat st;
                 if (stat(cand.c_str(), &st) != 0) continue;
                 if (!S_ISDIR(st.st_mode)) continue;
                 std::string uname = ent->d_name;
-                // call public API to ensure both /etc/passwd and vfs files are created.
-                // vfs_add_user is idempotent and returns quickly if already present.
+
                 vfs_add_user(uname.c_str());
             }
             closedir(d);
@@ -147,28 +140,24 @@ static void vfs_sync_loop(const std::string &vfs_dir) {
     }
 }
 
-/* Clean up on exit */
+/* Cleanup */
 void cleanup() {
     running.store(false);
     stop_users_vfs();
-    /* give sync thread time to exit (if running) */
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
 /* --------------------------------------------------------------------------------- */
 
 int main(int argc, char* argv[]) {
-    /* setup signals and exit cleanup */
     signal(SIGHUP, sighup_handler);
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);
     atexit(cleanup);
 
-    /* arguments */
     bool auto_vfs = true;
     bool test_mode = false;
 
-    // Detect CI
     if (getenv("CI")) {
         fprintf(stderr, "CI ENV detected — FUSE disabled, VFS active\n");
         auto_vfs = true;
@@ -181,123 +170,92 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: kubsh [OPTIONS]\n"
                       << "Options:\n"
                       << "  --no-vfs    Disable VFS auto-mount\n"
-                      << "  --test      Test mode (CI safe, disables VFS)\n"
-                      << "  --help, -h  Show this help\n";
+                      << "  --test      Test mode\n";
             return 0;
         }
     }
 
-    /* In test mode we MUST disable FUSE/VFS to avoid hanging in CI */
     if (test_mode) {
-        std::cout << "TEST MODE: disabling VFS (FUSE) for CI\n";
+        std::cout << "TEST MODE: disabling VFS\n";
         auto_vfs = false;
     }
 
-    /* DO NOT override KUBSH_VFS_DIR in CI — tests rely on it */
-    if (getenv("CI")) {
-        fprintf(stderr, "CI ENV detected — FUSE disabled, VFS active\n");
-    }
-
-    /* Start VFS only if allowed */
     if (auto_vfs) {
         const char* vfs_dir_env = getenv("KUBSH_VFS_DIR");
         std::string vfs_dir = vfs_dir_env ? vfs_dir_env : "users";
-
         mkdir(vfs_dir.c_str(), 0755);
 
-        /* Start main VFS watcher in vfs.c */
         std::thread vfs_thread([vfs_dir]() {
             start_users_vfs(vfs_dir.c_str());
         });
         vfs_thread.detach();
 
-        /* Start sync loop to keep /etc/passwd aligned and to avoid race with tests */
         std::thread vfs_sync_thread([vfs_dir]() {
             vfs_sync_loop(vfs_dir);
         });
         vfs_sync_thread.detach();
 
-        /* small initial sleep so background threads have a moment to start */
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    /* history */
     std::string history_file = get_history_file();
     using_history();
     read_history(history_file.c_str());
 
-    /* detect interactive */
     bool interactive = isatty(STDIN_FILENO);
-    if (test_mode) interactive = false; /* force non-interactive in CI */
+    if (test_mode) interactive = false;
 
-    /* Non-interactive batch mode when commands are provided */
+    /* non-interactive mode */
     if (!interactive && argc > 1) {
-        bool has_real_command = false;
         for (int i = 1; i < argc; ++i) {
-            if (argv[i][0] != '-') { has_real_command = true; break; }
-        }
+            std::string command = argv[i];
+            if (command.empty() || command[0] == '-') continue;
 
-        if (has_real_command) {
-            for (int i = 1; i < argc; ++i) {
-                std::string command = argv[i];
-                if (command.empty()) continue;
-                if (command[0] == '-') continue; /* skip options */
-
-                if (command == "\\q") break;
-                if (command.rfind("echo ", 0) == 0) {
-                    std::cout << command.substr(5) << std::endl;
-                    continue;
-                }
-                if (command.rfind("\\e $", 0) == 0) {
-                    std::string env_var = command.substr(4);
-                    if (env_var == "PATH") print_env_list(env_var);
-                    else {
-                        char* v = getenv(env_var.c_str());
-                        if (v) std::cout << v << std::endl;
-                    }
-                    continue;
-                }
-
-                auto tokens = split(command);
-                if (tokens.empty()) continue;
-
-                std::string exe = find_executable(tokens[0]);
-                if (exe.empty()) {
-                    std::cout << tokens[0] << ": command not found" << std::endl;
-                    continue;
-                }
-
-                std::vector<char*> args;
-                for (auto &s : tokens) args.push_back(const_cast<char*>(s.c_str()));
-                args.push_back(nullptr);
-
-                pid_t pid = fork();
-                if (pid == 0) {
-                    execve(exe.c_str(), args.data(), environ);
-                    perror("execve");
-                    _exit(127);
-                } else if (pid > 0) {
-                    int status = 0;
-                    waitpid(pid, &status, 0);
-                } else {
-                    perror("fork");
-                }
+            if (command == "\\q") break;
+            if (command.rfind("echo ", 0) == 0) {
+                std::cout << command.substr(5) << std::endl;
+                continue;
             }
-            return 0;
+            if (command.rfind("\\e $", 0) == 0) {
+                std::string env_var = command.substr(4);
+                char* v = getenv(env_var.c_str());
+                if (v) std::cout << v << std::endl;
+                continue;
+            }
+
+            auto tokens = split(command);
+            if (tokens.empty()) continue;
+
+            std::string exe = find_executable(tokens[0]);
+            if (exe.empty()) {
+                std::cout << tokens[0] << ": command not found" << std::endl;
+                continue;
+            }
+
+            std::vector<char*> args;
+            for (auto &s : tokens) args.push_back(const_cast<char*>(s.c_str()));
+            args.push_back(nullptr);
+
+            pid_t pid = fork();
+            if (pid == 0) {
+                execve(exe.c_str(), args.data(), environ);
+                perror("execve");
+                _exit(127);
+            }
+            if (pid > 0) waitpid(pid, NULL, 0);
         }
+        return 0;
     }
 
-    /* Interactive loop */
+    /* interactive loop */
     while (running.load()) {
         if (reload_config) {
             std::cout << "Configuration reloaded" << std::endl;
             reload_config = 0;
         }
 
-        char* line = nullptr;
-        if (interactive) {
-            line = readline("$ ");
-        } else {
+        char* line = interactive ? readline("$ ") : nullptr;
+        if (!interactive) {
             std::string input;
             if (!std::getline(std::cin, input)) break;
             line = strdup(input.c_str());
@@ -305,47 +263,14 @@ int main(int argc, char* argv[]) {
 
         if (!line) break;
         std::string command = line;
-
-        if (!command.empty()) {
-            add_history(line);
-            write_history(history_file.c_str());
-            std::ofstream h(history_file, std::ios::app);
-            if (h.is_open()) h << command << std::endl;
-        }
-
         free(line);
 
         if (command.empty()) continue;
 
-        /* builtins */
         if (command == "\\q") break;
-
-        if (command.rfind("debug ", 0) == 0) {
-            std::string arg = command.substr(6);
-            if (arg.size() >= 2 && arg.front() == '\'' && arg.back() == '\'') {
-                arg = arg.substr(1, arg.size() - 2);
-            }
-            std::cout << arg << std::endl;
-            continue;
-        }
 
         if (command.rfind("echo ", 0) == 0) {
             std::cout << command.substr(5) << std::endl;
-            continue;
-        }
-
-        if (command.rfind("\\e $", 0) == 0) {
-            std::string env_var = command.substr(4);
-            if (env_var == "PATH") print_env_list("PATH");
-            else {
-                char* v = getenv(env_var.c_str());
-                if (v) std::cout << v << std::endl;
-            }
-            continue;
-        }
-
-        if (command.rfind("\\l ", 0) == 0) {
-            list_partitions(command.substr(3));
             continue;
         }
 
@@ -361,12 +286,11 @@ int main(int argc, char* argv[]) {
                     if (pw) chdir(pw->pw_dir);
                 }
             } else {
-                if (chdir(tokens[1].c_str()) != 0) perror("cd");
+                chdir(tokens[1].c_str());
             }
             continue;
         }
 
-        /* external commands */
         std::string exe = find_executable(tokens[0]);
         if (exe.empty()) {
             std::cout << tokens[0] << ": command not found" << std::endl;
@@ -383,10 +307,7 @@ int main(int argc, char* argv[]) {
             perror("execve");
             _exit(127);
         } else if (pid > 0) {
-            int status = 0;
-            waitpid(pid, &status, 0);
-        } else {
-            perror("fork");
+            waitpid(pid, NULL, 0);
         }
     }
 
