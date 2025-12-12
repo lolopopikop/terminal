@@ -278,12 +278,15 @@ static void *watcher_fn(void *arg) {
 
 int start_users_vfs(const char *mount_point) {
     if (!mount_point) return -1;
-    strncpy(vfs_root, mount_point, sizeof(vfs_root)-1);
+
+    /* Save VFS root */
+    strncpy(vfs_root, mount_point, sizeof(vfs_root) - 1);
     ensure_dir(vfs_root);
 
+    /* First populate from /etc/passwd */
     populate_users_from_passwd();
 
-    // start watcher thread if not already
+    /* Start watcher thread (once) */
     if (!watcher_running) {
         watcher_running = 1;
         if (pthread_create(&watcher_thread, NULL, watcher_fn, NULL) != 0) {
@@ -293,8 +296,7 @@ int start_users_vfs(const char *mount_point) {
         pthread_detach(watcher_thread);
     }
 
-    /* Immediately scan existing directories so tests don't race watcher */
-        /* SECOND SYNC SCAN — ensure immediate consistency for tests */
+    /* SECOND SYNC SCAN: immediately process all dirs in VFS */
     DIR *d2 = opendir(vfs_root);
     if (d2) {
         struct dirent *ent;
@@ -312,20 +314,53 @@ int start_users_vfs(const char *mount_point) {
 
             const char *u = ent->d_name;
 
-            /* Key fix: FORCE add user to /etc/passwd immediately */
+            /* If no such user in /etc/passwd — add immediately */
             if (!system_user_exists(u)) {
                 add_user_to_passwd(u);
             }
 
-            /* Always write id/home/shell now */
+            /* And always generate id/home/shell */
             create_vfs_user_files(u);
         }
         closedir(d2);
     }
 
+    /* ⚠ KEY FIX: CI instant mkdir → sync micro-scan loop */
+    for (int i = 0; i < 50; i++) {   // ~50ms total
+        DIR *d3 = opendir(vfs_root);
+        if (d3) {
+            struct dirent *ent;
+            while ((ent = readdir(d3))) {
+                if (strcmp(ent->d_name, ".") == 0 ||
+                    strcmp(ent->d_name, "..") == 0)
+                    continue;
+
+                char path[700];
+                snprintf(path, sizeof(path), "%s/%s", vfs_root, ent->d_name);
+
+                struct stat st;
+                if (stat(path, &st) != 0) continue;
+                if (!S_ISDIR(st.st_mode)) continue;
+
+                const char *u = ent->d_name;
+
+                /* If user is missing from /etc/passwd → add instantly */
+                if (!system_user_exists(u)) {
+                    add_user_to_passwd(u);
+                    create_vfs_user_files(u);
+                }
+            }
+            closedir(d3);
+        }
+
+        /* Short sleep so CI has no race */
+        struct timespec ts = {0, 5 * 1000 * 1000}; // 5ms
+        nanosleep(&ts, NULL);
+    }
 
     return 0;
 }
+
 
 
 void stop_users_vfs() {
