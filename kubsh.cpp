@@ -36,7 +36,6 @@ std::atomic<bool> running(true);
 
 void sighup_handler(int /*sig*/) {
     const char msg[] = "Configuration reloaded\n";
-    /* write is async-signal-safe */
     write(STDOUT_FILENO, msg, sizeof(msg) - 1);
     reload_config = 1;
 }
@@ -76,52 +75,6 @@ static string find_executable(const string& command) {
         if (access(full.c_str(), X_OK) == 0) return full;
     }
     return "";
-}
-
-static void do_echo(const string &line) {
-    string rest = trim(line.substr(5));
-    cout << strip_quotes(rest) << endl;
-}
-
-static void do_debug(const string &line) {
-    string rest = trim(line.substr(6));
-    cout << strip_quotes(rest) << endl;
-}
-
-static void do_env(const string &line) {
-    string rest = trim(line.substr(3));
-    if (rest.empty() || rest[0] != '$') {
-        cout << "\\e: command not found" << endl;
-        return;
-    }
-    const char* val = getenv(rest.c_str()+1);
-    if (!val) return;
-    string s(val);
-    if (s.find(':') == string::npos) {
-        cout << s << endl;
-    } else {
-        string item;
-        stringstream ss(s);
-        while (getline(ss, item, ':')) cout << item << endl;
-    }
-}
-
-static void do_list(const string &line) {
-    string rest = trim(line.substr(3));
-    if (rest.empty()) {
-        cout << "\\l: missing argument" << endl;
-        return;
-    }
-    string cmd = "lsblk " + rest;
-    system(cmd.c_str());
-}
-
-static string get_history_file() {
-    char* home = getenv("HOME");
-    if (home) return string(home) + "/.kubsh_history";
-    struct passwd* pw = getpwuid(getuid());
-    if (pw) return string(pw->pw_dir) + "/.kubsh_history";
-    return "/root/.kubsh_history";
 }
 
 static void vfs_sync_loop(const string &vfs_dir) {
