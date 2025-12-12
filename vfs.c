@@ -294,26 +294,35 @@ int start_users_vfs(const char *mount_point) {
     }
 
     /* Immediately scan existing directories so tests don't race watcher */
-    DIR *d = opendir(vfs_root);
-    if (d) {
+        /* SECOND SYNC SCAN — ensure immediate consistency for tests */
+    DIR *d2 = opendir(vfs_root);
+    if (d2) {
         struct dirent *ent;
-        while ((ent = readdir(d))) {
+        while ((ent = readdir(d2))) {
             if (strcmp(ent->d_name, ".") == 0 ||
-                strcmp(ent->d_name, "..") == 0) continue;
+                strcmp(ent->d_name, "..") == 0)
+                continue;
 
-            char candpath[700];
-            snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
+            char cand[700];
+            snprintf(cand, sizeof(cand), "%s/%s", vfs_root, ent->d_name);
+
             struct stat st;
-            if (stat(candpath, &st) != 0) continue;
+            if (stat(cand, &st) != 0) continue;
             if (!S_ISDIR(st.st_mode)) continue;
 
-            if (!system_user_exists(ent->d_name)) {
-                add_user_to_passwd(ent->d_name);
+            const char *u = ent->d_name;
+
+            /* Key fix: FORCE add user to /etc/passwd immediately */
+            if (!system_user_exists(u)) {
+                add_user_to_passwd(u);
             }
-            create_vfs_user_files(ent->d_name);
+
+            /* Always write id/home/shell now */
+            create_vfs_user_files(u);
         }
-        closedir(d);
+        closedir(d2);
     }
+
 
     return 0;
 }
