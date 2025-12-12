@@ -13,6 +13,7 @@
 #include <time.h>
 #include <limits.h>
 #include <pwd.h>
+#include <fuse3/fuse.h>
 
 static char vfs_root[512] = {0};
 static pthread_mutex_t vfs_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -288,7 +289,7 @@ static int vfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_in
     (void)fi;
     
     char full_path[1024];
-    snprintf(full_path, sizeof(fullpath), "%s%s", vfs_root, path);
+    snprintf(full_path, sizeof(full_path), "%s%s", vfs_root, path);
     
     memset(stbuf, 0, sizeof(struct stat));
     
@@ -318,7 +319,7 @@ static int vfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     (void)flags;
     
     char full_path[1024];
-    snprintf(full_path, sizeof(fullpath), "%s%s", vfs_root, path);
+    snprintf(full_path, sizeof(full_path), "%s%s", vfs_root, path);
     
     filler(buf, ".", NULL, 0, 0);
     filler(buf, "..", NULL, 0, 0);
@@ -362,7 +363,7 @@ static int vfs_mkdir(const char *path, mode_t mode) {
     
     // Create the directory
     char full_path[1024];
-    snprintf(full_path, sizeof(fullpath), "%s/%s", vfs_root, username);
+    snprintf(full_path, sizeof(full_path), "%s/%s", vfs_root, username);
     
     if (mkdir(full_path, 0755) == -1) {
         return -errno;
@@ -382,7 +383,7 @@ static int vfs_mkdir(const char *path, mode_t mode) {
 /* FUSE operation: open */
 static int vfs_open(const char *path, struct fuse_file_info *fi) {
     char full_path[1024];
-    snprintf(full_path, sizeof(fullpath), "%s%s", vfs_root, path);
+    snprintf(full_path, sizeof(full_path), "%s%s", vfs_root, path);
     
     int fd = open(full_path, fi->flags);
     if (fd == -1) return -errno;
@@ -397,7 +398,7 @@ static int vfs_read(const char *path, char *buf, size_t size, off_t offset,
     (void)fi;
     
     char full_path[1024];
-    snprintf(full_path, sizeof(fullpath), "%s%s", vfs_root, path);
+    snprintf(full_path, sizeof(full_path), "%s%s", vfs_root, path);
     
     int fd = open(full_path, O_RDONLY);
     if (fd == -1) return -errno;
@@ -424,6 +425,7 @@ int start_users_vfs(const char *mount_point) {
     
     // Store mount point
     strncpy(vfs_root, mount_point, sizeof(vfs_root)-1);
+    vfs_root[sizeof(vfs_root)-1] = '\0';
     
     // Create root directory
     ensure_dir(vfs_root);
@@ -468,7 +470,7 @@ void stop_users_vfs() {
     if (!getenv("CI")) {
         char cmd[512];
         snprintf(cmd, sizeof(cmd), "fusermount -u %s 2>/dev/null", vfs_root);
-        system(cmd);
+        int unused __attribute__((unused)) = system(cmd);
     }
 }
 
