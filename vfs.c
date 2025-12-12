@@ -127,6 +127,7 @@ static int fill_user_from_passwd(const char *username, int *out_uid, char *out_h
             }
             /* fields: 0=name,1=passwd,2=uid,3=gid,4=gecos,5=home,6=shell */
             if (fields[2]) *out_uid = atoi(fields[2]);
+            else *out_uid = 0;
             if (fields[5]) {
                 strncpy(out_home, fields[5], home_sz-1);
                 out_home[home_sz-1] = '\0';

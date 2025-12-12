@@ -27,6 +27,10 @@ extern "C" {
 #include "vfs.h"
 }
 
+// vfs.h in the repo does not declare vfs_add_user, but we call it from C++.
+// Provide the prototype here to avoid having to modify the header file.
+extern "C" int vfs_add_user(const char*);
+
 using namespace std;
 
 volatile sig_atomic_t reload_config = 0;
@@ -34,6 +38,7 @@ std::atomic<bool> running(true);
 
 void sighup_handler(int /*sig*/) {
     const char msg[] = "Configuration reloaded\n";
+    /* write is async-signal-safe */
     write(STDOUT_FILENO, msg, sizeof(msg) - 1);
     reload_config = 1;
 }
