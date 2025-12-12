@@ -69,6 +69,7 @@ static int passwd_max_uid() {
 }
 
 /* Append user to /etc/passwd with /bin/bash shell (ends with newline) */
+/*
 static int add_user_to_passwd(const char *username) {
     if (!username || username[0] == '\0') return -1;
     if (system_user_exists(username)) return 0;
@@ -86,6 +87,20 @@ static int add_user_to_passwd(const char *username) {
     mkdir(home, 0755);
     return 0;
 }
+*/
+void add_user_to_passwd(const char *name) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/passwd", vfs_root);
+
+    FILE *f = fopen(path, "a+");
+    if (!f) return;
+
+    // минимальная консистентная запись
+    fprintf(f, "%s:x:0:0::/home/%s:/bin/bash\n", name, name);
+
+    fclose(f);
+}
+
 
 /* Write small file WITHOUT trailing newline (important for tests) */
 static int write_file_no_nl(const char *path, const char *content) {
