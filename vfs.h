@@ -7,4 +7,9 @@
 int start_users_vfs(const char *mount_point);
 void stop_users_vfs();
 
+/* ← ЭТО ДОБАВИТЬ */
+int vfs_add_user(const char *username);
+int vfs_user_exists(const char *username);
+void vfs_list_users(void (*callback)(const char *));
+
 #endif
