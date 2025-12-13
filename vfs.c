@@ -1,367 +1,432 @@
-#define _GNU_SOURCE
-#include "vfs.h"
+#define FUSE_USE_VERSION 31
+#include <fuse3/fuse.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <errno.h>
 #include <dirent.h>
+#include <sys/types.h>
+#include <pwd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <fcntl.h>
-#include <pthread.h>
-#include <time.h>
-#include <sys/inotify.h>
+#include <signal.h>
 #include <limits.h>
+#include <time.h>
 
-static char vfs_root[512] = {0};
-static pthread_t watcher_thread;
-static int watcher_running = 0;
+static int vfs_pid = -1;
+static struct passwd **users = NULL;
+static int user_count = 0;
 
-/* Helpers */
-static int ensure_dir(const char *path) {
-    if (mkdir(path, 0755) == -1 && errno != EEXIST) {
+int get_users_list() {
+    // Освобождаем старый список если есть
+    if (users != NULL) {
+        for (int i = 0; i < user_count; i++) {
+            if (users[i]) {
+                free((void*)users[i]->pw_name);
+                free((void*)users[i]->pw_passwd);
+                free((void*)users[i]->pw_gecos);
+                free((void*)users[i]->pw_dir);
+                free((void*)users[i]->pw_shell);
+                free(users[i]);
+            }
+        }
+        free(users);
+        users = NULL;
+        user_count = 0;
+    }
+    
+    // Получаем список всех пользователей
+    struct passwd *pwd;
+    int count = 0;
+    
+    // Подсчитываем количество пользователей
+    setpwent();
+    while ((pwd = getpwent()) != NULL) {
+        count++;
+    }
+    endpwent();
+    
+    if (count <= 0) {
+        return 0;
+    }
+    
+    // Выделяем память
+    users = malloc(sizeof(struct passwd *) * count);
+    if (!users) {
         return -1;
     }
+    
+    // Заполняем массив
+    setpwent();
+    int i = 0;
+    while ((pwd = getpwent()) != NULL && i < count) {
+        users[i] = malloc(sizeof(struct passwd));
+        if (!users[i]) {
+            endpwent();
+            return -1;
+        }
+        
+        // Копируем структуру
+        memcpy(users[i], pwd, sizeof(struct passwd));
+        
+        // Копируем строки отдельно
+        users[i]->pw_name = strdup(pwd->pw_name);
+        users[i]->pw_passwd = strdup(pwd->pw_passwd ? pwd->pw_passwd : "x");
+        users[i]->pw_gecos = strdup(pwd->pw_gecos ? pwd->pw_gecos : "");
+        users[i]->pw_dir = strdup(pwd->pw_dir);
+        users[i]->pw_shell = strdup(pwd->pw_shell);
+        
+        i++;
+    }
+    endpwent();
+    
+    user_count = i;
+    return user_count;
+}
+
+void free_users_list() {
+    if (users != NULL) {
+        for (int i = 0; i < user_count; i++) {
+            if (users[i]) {
+                free((void*)users[i]->pw_name);
+                free((void*)users[i]->pw_passwd);
+                free((void*)users[i]->pw_gecos);
+                free((void*)users[i]->pw_dir);
+                free((void*)users[i]->pw_shell);
+                free(users[i]);
+            }
+        }
+        free(users);
+        users = NULL;
+        user_count = 0;
+    }
+}
+
+static int users_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
+                         off_t offset, struct fuse_file_info *fi,
+                         enum fuse_readdir_flags flags) {
+    (void) offset;
+    (void) fi;
+    (void) flags;
+    
+    // Корневой каталог
+    if (strcmp(path, "/") == 0) {
+        filler(buf, ".", NULL, 0, 0);
+        filler(buf, "..", NULL, 0, 0);
+        
+        for (int i = 0; i < user_count; i++) {
+            if (users[i] && users[i]->pw_name && users[i]->pw_shell) {
+                // Показываем только пользователей с shell, содержащим "sh"
+                if (strstr(users[i]->pw_shell, "sh") != NULL) {
+                    filler(buf, users[i]->pw_name, NULL, 0, 0);
+                }
+            }
+        }
+        return 0;
+    }
+    
+    // Каталог пользователя
+    char username[NAME_MAX];
+    if (sscanf(path, "/%255[^/]", username) == 1) {
+        for (int i = 0; i < user_count; i++) {
+            if (users[i] && users[i]->pw_name && strcmp(users[i]->pw_name, username) == 0) {
+                filler(buf, ".", NULL, 0, 0);
+                filler(buf, "..", NULL, 0, 0);
+                filler(buf, "id", NULL, 0, 0);
+                filler(buf, "home", NULL, 0, 0);
+                filler(buf, "shell", NULL, 0, 0);
+                return 0;
+            }
+        }
+    }
+    
+    return -ENOENT;
+}
+
+static int users_open(const char *path, struct fuse_file_info *fi) {
+    (void) fi;
     return 0;
 }
 
-/* Check if user exists in /etc/passwd */
-static int system_user_exists(const char *username) {
-    FILE *f = fopen("/etc/passwd", "r");
-    if (!f) return 0;
-    char line[1024];
-    size_t un_len = strlen(username);
-    int ok = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, username, un_len) == 0 && line[un_len] == ':') {
-            ok = 1;
+static int users_read(const char *path, char *buf, size_t size, off_t offset,
+                      struct fuse_file_info *fi) {
+    (void) fi;
+    
+    char username[NAME_MAX];
+    char filename[NAME_MAX];
+    
+    if (sscanf(path, "/%255[^/]/%255s", username, filename) != 2) {
+        return -ENOENT;
+    }
+    
+    // Ищем пользователя
+    struct passwd *pwd = NULL;
+    for (int i = 0; i < user_count; i++) {
+        if (users[i] && users[i]->pw_name && strcmp(users[i]->pw_name, username) == 0) {
+            pwd = users[i];
             break;
         }
     }
-    fclose(f);
-    return ok;
-}
-
-/* Return max uid found in /etc/passwd (or 1000) */
-static int passwd_max_uid() {
-    FILE *f = fopen("/etc/passwd", "r");
-    if (!f) return 1000;
-    char line[1024];
-    int max_uid = 1000;
-    while (fgets(line, sizeof(line), f)) {
-        // fields: name:passwd:uid:gid:gecos:home:shell
-        char *p = line;
-        // skip name
-        p = strchr(p, ':');
-        if (!p) continue;
-        p++;
-        // skip passwd
-        p = strchr(p, ':');
-        if (!p) continue;
-        p++;
-        // now p points to uid
-        int uid = atoi(p);
-        if (uid > max_uid) max_uid = uid;
+    
+    if (!pwd) {
+        return -ENOENT;
     }
-    fclose(f);
-    return max_uid;
-}
-
-/* Append user to /etc/passwd with /bin/bash shell (ends with newline) */
-static int add_user_to_passwd(const char *username) {
-    if (!username || username[0] == '\0') return -1;
-    if (system_user_exists(username)) return 0;
-    int max_uid = passwd_max_uid();
-    int new_uid = max_uid + 1;
-    FILE *f = fopen("/etc/passwd", "a");
-    if (!f) return -1;
-    // format: name:x:uid:gid:gecos:home:shell\n
-    int w = fprintf(f, "%s:x:%d:%d::/home/%s:/bin/bash\n", username, new_uid, new_uid, username);
-    fclose(f);
-    if (w < 0) return -1;
-    // try create home directory (best-effort)
-    char home[512];
-    snprintf(home, sizeof(home), "/home/%s", username);
-    mkdir(home, 0755);
-    return 0;
-}
-
-/* Write small file WITHOUT trailing newline (important for tests) */
-static int write_file_no_nl(const char *path, const char *content) {
-    if (!path) return -1;
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    ssize_t len = content ? (ssize_t)strlen(content) : 0;
-    ssize_t wrote = 0;
-    while (wrote < len) {
-        ssize_t r = write(fd, content + wrote, len - wrote);
-        if (r <= 0) { close(fd); return -1; }
-        wrote += r;
+    
+    const char *content = NULL;
+    char id_buf[32];
+    
+    if (strcmp(filename, "id") == 0) {
+        snprintf(id_buf, sizeof(id_buf), "%d", pwd->pw_uid);
+        content = id_buf;
+    } else if (strcmp(filename, "home") == 0) {
+        content = pwd->pw_dir;
+    } else if (strcmp(filename, "shell") == 0) {
+        content = pwd->pw_shell;
+    } else {
+        return -ENOENT;
     }
-    close(fd);
-    return 0;
+    
+    if (!content) {
+        content = "";
+    }
+    
+    size_t len = strlen(content);
+    if ((size_t)offset >= len) {
+        return 0;
+    }
+    
+    size_t to_copy = len - offset;
+    if (to_copy > size) {
+        to_copy = size;
+    }
+    
+    memcpy(buf, content + offset, to_copy);
+    return to_copy;
 }
 
-/* Create vfs entry for a username: create dir and id/home/shell files */
-static void create_vfs_user_files(const char *username) {
-    char path[600];
-    snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
-    ensure_dir(path);
-
-    // find uid from /etc/passwd (new value)
-    int uid = 0;
-    FILE *f = fopen("/etc/passwd", "r");
-    if (f) {
-        char line[1024];
-        while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, username, strlen(username)) == 0 && line[strlen(username)] == ':') {
-                // parse uid: name:pw:uid:...
-                char *p = line;
-                p = strchr(p, ':'); if (!p) break; p++;
-                p = strchr(p, ':'); if (!p) break; p++;
-                uid = atoi(p);
-                break;
-            }
-        }
-        fclose(f);
+static int users_getattr(const char *path, struct stat *stbuf,
+                         struct fuse_file_info *fi) {
+    (void) fi;
+    
+    memset(stbuf, 0, sizeof(struct stat));
+    stbuf->st_uid = getuid();
+    stbuf->st_gid = getgid();
+    time_t now = time(NULL);
+    stbuf->st_atime = stbuf->st_mtime = stbuf->st_ctime = now;
+    
+    // Корневой каталог
+    if (strcmp(path, "/") == 0) {
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+        return 0;
     }
-    char idbuf[32];
-    snprintf(idbuf, sizeof(idbuf), "%d", uid);
-    char idpath[700], homepath[700], shellpath[700];
-    snprintf(idpath, sizeof(idpath), "%s/id", path);
-    snprintf(homepath, sizeof(homepath), "%s/home", path);
-    snprintf(shellpath, sizeof(shellpath), "%s/shell", path);
-
-    write_file_no_nl(idpath, idbuf);
-    // home from /etc/passwd
-    // read home and shell quickly
-    char homebuf[512] = {0};
-    char shellbuf[256] = {0};
-    f = fopen("/etc/passwd", "r");
-    if (f) {
-        char line[1024];
-        while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, username, strlen(username)) == 0 && line[strlen(username)] == ':') {
-                // split fields: name:pw:uid:gid:gecos:home:shell
-                char *fields[7] = {0};
-                char *p = line;
-                for (int i = 0; i < 7; ++i) {
-                    fields[i] = p;
-                    char *q = strchr(p, ':');
-                    if (!q) break;
-                    *q = '\0';
-                    p = q + 1;
+    
+    char username[NAME_MAX];
+    char filename[NAME_MAX];
+    
+    // Каталог пользователя
+    if (sscanf(path, "/%255[^/]", username) == 1) {
+        if (strchr(path + 1, '/') == NULL) {
+            for (int i = 0; i < user_count; i++) {
+                if (users[i] && users[i]->pw_name && 
+                    strcmp(users[i]->pw_name, username) == 0) {
+                    if (users[i]->pw_shell && strstr(users[i]->pw_shell, "sh") != NULL) {
+                        stbuf->st_mode = S_IFDIR | 0755;
+                        stbuf->st_nlink = 2;
+                        return 0;
+                    }
                 }
-                if (fields[5]) strncpy(homebuf, fields[5], sizeof(homebuf)-1);
-                if (fields[6]) {
-                    // fields[6] may include trailing newline
-                    char *nl = strchr(fields[6], '\n');
-                    if (nl) *nl = '\0';
-                    strncpy(shellbuf, fields[6], sizeof(shellbuf)-1);
-                }
-                break;
             }
-        }
-        fclose(f);
-    }
-    write_file_no_nl(homepath, homebuf);
-    write_file_no_nl(shellpath, shellbuf);
-}
-
-/* Populate users/ from /etc/passwd: only shells containing 'sh' */
-static void populate_users_from_passwd() {
-    ensure_dir(vfs_root);
-    FILE *f = fopen("/etc/passwd", "r");
-    if (!f) return;
-    char line[1024];
-    while (fgets(line, sizeof(line), f)) {
-        // check shell field
-        char *last_colon = strrchr(line, ':');
-        if (!last_colon) continue;
-        char *shell = last_colon + 1;
-        if (!strstr(shell, "sh")) continue; // only shell users
-        // extract username (before first colon)
-        char *first_colon = strchr(line, ':');
-        if (!first_colon) continue;
-        *first_colon = '\0';
-        const char *username = line;
-        if (username && username[0]) {
-            char path[600];
-            snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
-            ensure_dir(path);
-            // create id/home/shell files (no trailing newline)
-            create_vfs_user_files(username);
-        }
-    }
-    fclose(f);
-}
-
-/* inotify-based watcher: reacts to IN_CREATE (dirs) and also fallback to polling */
-static void *watcher_fn(void *arg) {
-    (void)arg;
-    int inotify_fd = -1;
-    int wd = -1;
-
-    // try to create inotify instance
-    inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-    if (inotify_fd >= 0) {
-        wd = inotify_add_watch(inotify_fd, vfs_root, IN_CREATE | IN_MOVED_TO | IN_ONLYDIR);
-    }
-
-    while (watcher_running) {
-        int did_work = 0;
-
-        if (inotify_fd >= 0 && wd >= 0) {
-            char buf[4096]
-                __attribute__ ((aligned(__alignof__(struct inotify_event))));
-            ssize_t len = read(inotify_fd, buf, sizeof(buf));
-            if (len > 0) {
-                ssize_t i = 0;
-                while (i < len) {
-                    struct inotify_event *ev = (struct inotify_event *)(buf + i);
-                    if (ev->len > 0) {
-                        if ((ev->mask & IN_ISDIR) && (ev->mask & (IN_CREATE | IN_MOVED_TO))) {
-                            // new directory created/moved into vfs_root
-                            if (!system_user_exists(ev->name)) {
-                                add_user_to_passwd(ev->name);
+        } else if (sscanf(path, "/%255[^/]/%255s", username, filename) == 2) {
+            // Файл в каталоге пользователя
+            for (int i = 0; i < user_count; i++) {
+                if (users[i] && users[i]->pw_name && 
+                    strcmp(users[i]->pw_name, username) == 0) {
+                    if (users[i]->pw_shell && strstr(users[i]->pw_shell, "sh") != NULL) {
+                        if (strcmp(filename, "id") == 0 ||
+                            strcmp(filename, "home") == 0 ||
+                            strcmp(filename, "shell") == 0) {
+                            stbuf->st_mode = S_IFREG | 0444;
+                            stbuf->st_nlink = 1;
+                            
+                            if (strcmp(filename, "id") == 0) {
+                                char id_buf[32];
+                                snprintf(id_buf, sizeof(id_buf), "%d", users[i]->pw_uid);
+                                stbuf->st_size = strlen(id_buf);
+                            } else if (strcmp(filename, "home") == 0) {
+                                stbuf->st_size = strlen(users[i]->pw_dir);
+                            } else if (strcmp(filename, "shell") == 0) {
+                                stbuf->st_size = strlen(users[i]->pw_shell);
                             }
-                            create_vfs_user_files(ev->name);
+                            return 0;
                         }
-                        // handle other events if needed
-                    }
-                    i += sizeof(struct inotify_event) + ev->len;
-                }
-                did_work = 1;
-            } else if (len == -1 && errno != EAGAIN) {
-                // if inotify read failed fatally, fall back to poll
-                close(inotify_fd);
-                inotify_fd = -1;
-                wd = -1;
-            }
-        }
-
-        // fallback / safety scan (fast): do a single quick directory scan if no inotify events
-        if (!did_work) {
-            DIR *d = opendir(vfs_root);
-            if (d) {
-                struct dirent *ent;
-                while ((ent = readdir(d))) {
-                    if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-                    char candpath[700];
-                    snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
-                    struct stat st;
-                    if (stat(candpath, &st) != 0) continue;
-                    if (!S_ISDIR(st.st_mode)) continue;
-                    if (!system_user_exists(ent->d_name)) {
-                        add_user_to_passwd(ent->d_name);
-                        create_vfs_user_files(ent->d_name);
-                    } else {
-                        create_vfs_user_files(ent->d_name);
                     }
                 }
-                closedir(d);
-                did_work = 1;
             }
         }
-
-        // sleep briefly: if inotify is active, this iteration will be cheap; if not, keep 100ms
-        struct timespec ts = {0, 100 * 1000 * 1000}; // 100ms
-        nanosleep(&ts, NULL);
     }
-
-    if (inotify_fd >= 0) close(inotify_fd);
-    return NULL;
+    
+    return -ENOENT;
 }
 
-/* Public API */
+// ... предыдущий код без изменений ...
+
+static int users_mkdir(const char *path, mode_t mode) {
+    (void) mode;
+    
+    char username[NAME_MAX];
+    if (sscanf(path, "/%255[^/]", username) != 1) {
+        return -EINVAL;
+    }
+    
+    // Проверяем, что такого пользователя еще нет
+    for (int i = 0; i < user_count; i++) {
+        if (users[i] && users[i]->pw_name && strcmp(users[i]->pw_name, username) == 0) {
+            return -EEXIST;
+        }
+    }
+    
+    // Добавляем пользователя через useradd
+    char command[512];
+    snprintf(command, sizeof(command), 
+             "useradd -m -s /bin/bash %s >/dev/null 2>&1", username);
+    
+    int ret = system(command);
+    if (ret != 0) {
+        // Если useradd не сработал, пробуем добавить вручную в /etc/passwd
+        // Это для тестов, где useradd может быть недоступен
+        FILE *f = fopen("/etc/passwd", "a");
+        if (f) {
+            int uid = 1000 + user_count;
+            fprintf(f, "%s:x:%d:%d::/home/%s:/bin/bash\n", 
+                    username, uid, uid, username);
+            fclose(f);
+            ret = 0;
+        }
+    }
+    
+    if (ret == 0) {
+        // Обновляем список пользователей
+        get_users_list();
+    }
+    
+    return ret == 0 ? 0 : -EIO;
+}
+
+static int users_rmdir(const char *path) {
+    char username[NAME_MAX];
+    if (sscanf(path, "/%255[^/]", username) != 1) {
+        return -EINVAL;
+    }
+    
+    // Проверяем, что пользователь существует
+    int found = 0;
+    for (int i = 0; i < user_count; i++) {
+        if (users[i] && users[i]->pw_name && strcmp(users[i]->pw_name, username) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    
+    if (!found) {
+        return -ENOENT;
+    }
+    
+    // Удаляем пользователя через userdel
+    char command[512];
+    snprintf(command, sizeof(command), 
+             "userdel -r %s >/dev/null 2>&1", username);
+    
+    int ret = system(command);
+    if (ret != 0) {
+        // Если userdel не сработал, удаляем из /etc/passwd вручную
+        // Это для тестов
+        FILE *fin = fopen("/etc/passwd", "r");
+        if (fin) {
+            FILE *fout = fopen("/etc/passwd.tmp", "w");
+            if (fout) {
+                char line[256];
+                while (fgets(line, sizeof(line), fin)) {
+                    if (strstr(line, username) == NULL) {
+                        fputs(line, fout);
+                    }
+                }
+                fclose(fout);
+                fclose(fin);
+                rename("/etc/passwd.tmp", "/etc/passwd");
+                ret = 0;
+            } else {
+                fclose(fin);
+            }
+        }
+    }
+    
+    if (ret == 0) {
+        // Обновляем список пользователей
+        get_users_list();
+    }
+    
+    return ret == 0 ? 0 : -EIO;
+}
+
+// ... остальной код без изменений ...
+
+static struct fuse_operations users_oper = {
+    .getattr = users_getattr,
+    .open = users_open,
+    .read = users_read,
+    .readdir = users_readdir,
+    .mkdir = users_mkdir,
+    .rmdir = users_rmdir,
+};
 
 int start_users_vfs(const char *mount_point) {
-    if (!mount_point) return -1;
-    strncpy(vfs_root, mount_point, sizeof(vfs_root)-1);
-    ensure_dir(vfs_root);
-
-    populate_users_from_passwd();
-
-    // start watcher thread if not already
-    if (!watcher_running) {
-        watcher_running = 1;
-        if (pthread_create(&watcher_thread, NULL, watcher_fn, NULL) != 0) {
-            watcher_running = 0;
-            return -1;
+    // Создаем точку монтирования если не существует
+    mkdir(mount_point, 0755);
+    
+    int pid = fork();    
+    if (pid == 0) {
+        // Дочерний процесс
+        char *fuse_argv[] = {
+            "users_vfs",        // имя программы
+            "-f",               // foreground mode
+            "-s",               // single-threaded
+            (char*)mount_point, // точка монтирования
+            NULL
+        };
+        
+        // Получаем список пользователей
+        if (get_users_list() <= 0) {
+            fprintf(stderr, "Не удалось получить список пользователей\n");
+            exit(1);
         }
-        pthread_detach(watcher_thread);
+        
+        // Запускаем FUSE
+        int ret = fuse_main(4, fuse_argv, &users_oper, NULL);
+        
+        // Очищаем перед выходом
+        free_users_list();
+        exit(ret);
+    } else if (pid > 0) { 
+        // Родительский процесс
+        vfs_pid = pid;
+        
+        // Даем время на монтирование
+        sleep(1);
+        
+        return 0;
+    } else {
+        perror("fork");
+        return -1;
     }
-
-    /* Immediately scan existing directories so tests don't race watcher */
-    DIR *d = opendir(vfs_root);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d))) {
-            if (strcmp(ent->d_name, ".") == 0 ||
-                strcmp(ent->d_name, "..") == 0) continue;
-
-            char candpath[700];
-            snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
-            struct stat st;
-            if (stat(candpath, &st) != 0) continue;
-            if (!S_ISDIR(st.st_mode)) continue;
-
-            if (!system_user_exists(ent->d_name)) {
-                add_user_to_passwd(ent->d_name);
-            }
-            create_vfs_user_files(ent->d_name);
-        }
-        closedir(d);
-    }
-
-    return 0;
 }
-
 
 void stop_users_vfs() {
-    if (watcher_running) {
-        watcher_running = 0;
-        // thread is detached; give it a moment (best-effort)
-        struct timespec ts = {0, 50 * 1000 * 1000};
-        nanosleep(&ts, NULL);
+    if (vfs_pid != -1) {
+        kill(vfs_pid, SIGTERM);
+        waitpid(vfs_pid, NULL, 0);
+        vfs_pid = -1;
     }
-}
-
-int vfs_add_user(const char *username) {
-    if (!username) return -1;
-    // create the directory (tests call (vfs / username).mkdir(...))
-    char path[700];
-    snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
-    if (ensure_dir(path) != 0) return -1;
-    // also ensure it's in passwd (watcher will eventually add, but do best-effort now)
-    if (!system_user_exists(username)) {
-        add_user_to_passwd(username);
-    }
-    create_vfs_user_files(username);
-    return 0;
-}
-
-int vfs_user_exists(const char *username) {
-    char path[700];
-    snprintf(path, sizeof(path), "%s/%s", vfs_root, username);
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-void vfs_list_users(void (*callback)(const char *)) {
-    if (!callback) return;
-    DIR *d = opendir(vfs_root);
-    if (!d) return;
-    struct dirent *ent;
-    while ((ent = readdir(d))) {
-        if (strcmp(ent->d_name, ".") == 0 ||
-            strcmp(ent->d_name, "..") == 0) continue;
-        char candpath[700];
-        snprintf(candpath, sizeof(candpath), "%s/%s", vfs_root, ent->d_name);
-        struct stat st;
-        if (stat(candpath, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) callback(ent->d_name);
-    }
-    closedir(d);
 }
