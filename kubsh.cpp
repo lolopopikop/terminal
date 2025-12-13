@@ -1,6 +1,5 @@
 #include <iostream>
 #include <string>
-#include <fstream>
 #include <vector>
 #include <sstream>
 #include <unistd.h>
@@ -11,6 +10,7 @@
 #include <pwd.h>
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <atomic>
 
 extern char **environ;
 
@@ -18,115 +18,124 @@ extern "C" {
 #include "vfs.h"
 }
 
+std::atomic<bool> running(true);
 volatile sig_atomic_t reload_config = 0;
 
 void sighup_handler(int) {
     std::cout << "Configuration reloaded" << std::endl;
+    reload_config = 1;
 }
 
-std::vector<std::string> split(const std::string& s) {
+std::vector<std::string> split(const std::string &s) {
     std::stringstream ss(s);
-    std::string tok;
     std::vector<std::string> out;
-    while (ss >> tok) out.push_back(tok);
+    std::string t;
+    while (ss >> t) out.push_back(t);
     return out;
 }
 
-void print_env_list(const std::string& var) {
-    char* v = getenv(var.c_str());
-    if (!v) return;
-
-    std::stringstream ss(v);
-    std::string item;
-    while (std::getline(ss, item, ':')) {
-        std::cout << item << std::endl;
-    }
-}
-
-std::string find_exec(const std::string& cmd) {
-    char* p = getenv("PATH");
-    if (!p) return "";
-
-    std::stringstream ss(p);
+std::string find_executable(const std::string &cmd) {
+    char *path = getenv("PATH");
+    if (!path) return "";
+    std::stringstream ss(path);
     std::string dir;
     while (std::getline(ss, dir, ':')) {
         std::string full = dir + "/" + cmd;
-        if (access(full.c_str(), X_OK) == 0)
-            return full;
+        if (access(full.c_str(), X_OK) == 0) return full;
     }
     return "";
 }
 
+void cleanup() {
+    running = false;
+    stop_users_vfs();
+}
+
 int main() {
     signal(SIGHUP, sighup_handler);
+    atexit(cleanup);
 
-    struct stat st;
-    if (stat("users", &st) == -1) {
-        start_users_vfs("users");
-    }
+    // ВСЕГДА монтируем VFS
+    start_users_vfs("users");
+
+    using_history();
+    read_history("~/.kubsh_history");
 
     bool interactive = isatty(STDIN_FILENO);
 
-    while (true) {
-        std::string cmd;
+    while (running) {
+        std::string command;
         if (interactive) {
-            char* line = readline("$ ");
+            char *line = readline("$ ");
             if (!line) break;
-            cmd = line;
-            if (!cmd.empty()) add_history(line);
+            command = line;
             free(line);
         } else {
-            if (!std::getline(std::cin, cmd)) break;
+            if (!std::getline(std::cin, command)) break;
         }
 
-        if (cmd.empty()) continue;
-        if (cmd == "\\q") break;
+        if (command.empty()) continue;
+
+        add_history(command.c_str());
+        write_history("~/.kubsh_history");
+
+        auto tokens = split(command);
+        if (tokens.empty()) continue;
+
+        // \q
+        if (tokens[0] == "\\q") break;
+
+        // debug
+        if (tokens[0] == "debug") {
+            if (tokens.size() > 1) {
+                std::string out = command.substr(6);
+                if (out.front() == '\'' && out.back() == '\'')
+                    out = out.substr(1, out.size() - 2);
+                std::cout << out << std::endl;
+            }
+            continue;
+        }
 
         // echo
-        if (cmd.rfind("echo ", 0) == 0) {
-            std::string out = cmd.substr(5);
-            if (out.size() >= 2 && out.front() == '"' && out.back() == '"') {
-                out = out.substr(1, out.size() - 2);
-            }
-            std::cout << out << std::endl;
+        if (tokens[0] == "echo") {
+            std::cout << command.substr(5) << std::endl;
             continue;
         }
 
-        // env
-        if (cmd.rfind("\\e $", 0) == 0) {
-            std::string var = cmd.substr(4);
-            if (var == "PATH") {
-                print_env_list(var);
-            } else {
-                char* v = getenv(var.c_str());
-                if (v) std::cout << v << std::endl;
+        // \e
+        if (tokens[0] == "\\e" && tokens.size() == 2) {
+            char *v = getenv(tokens[1].substr(1).c_str());
+            if (v) {
+                std::stringstream ss(v);
+                std::string p;
+                while (std::getline(ss, p, ':'))
+                    std::cout << p << std::endl;
             }
             continue;
         }
 
-        auto args = split(cmd);
-        if (args.empty()) continue;
+        // cd
+        if (tokens[0] == "cd") {
+            chdir(tokens.size() > 1 ? tokens[1].c_str() : getenv("HOME"));
+            continue;
+        }
 
-        std::string exe = find_exec(args[0]);
+        std::string exe = find_executable(tokens[0]);
         if (exe.empty()) {
-            std::cout << args[0] << ": command not found" << std::endl;
+            std::cout << tokens[0] << ": command not found" << std::endl;
             continue;
         }
 
-        std::vector<char*> argv;
-        for (auto& s : args)
-            argv.push_back(const_cast<char*>(s.c_str()));
-        argv.push_back(nullptr);
+        std::vector<char *> args;
+        for (auto &s : tokens) args.push_back((char *)s.c_str());
+        args.push_back(nullptr);
 
-        pid_t pid = fork();
-        if (pid == 0) {
-            execve(exe.c_str(), argv.data(), environ);
+        if (fork() == 0) {
+            execve(exe.c_str(), args.data(), environ);
             _exit(127);
-        } else {
-            waitpid(pid, nullptr, 0);
         }
+        wait(nullptr);
     }
 
-    stop_users_vfs();
     return 0;
 }
