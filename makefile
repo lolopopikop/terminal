@@ -1,12 +1,18 @@
 CXX = g++
 CC = gcc
+
 CXXFLAGS = -std=c++17 -Wall -Wextra -O2 -D_FILE_OFFSET_BITS=64
-CFLAGS = -Wall -Wextra -O2 -D_FILE_OFFSET_BITS=64
+CFLAGS   = -Wall -Wextra -O2 -D_FILE_OFFSET_BITS=64
+
 LDFLAGS = -lreadline -lfuse3 -lstdc++ -lpthread
-TARGET = kubsh
+
+TARGET  = kubsh
 PACKAGE = kubsh
 VERSION = 1.0
-ARCH = amd64
+ARCH    = amd64
+
+DEB_DIR = debian/$(PACKAGE)
+DEB_OUT = $(PACKAGE).deb
 
 .PHONY: all clean run deb install uninstall test
 
@@ -22,40 +28,40 @@ vfs.o: vfs.c vfs.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 run: $(TARGET)
-	@echo "Starting kubsh..."
 	./$(TARGET)
 
 clean:
-	rm -f *.o $(TARGET) $(TARGET)-$(VERSION).tar.gz
-	rm -rf debian/$(TARGET)
-	rm -f $(TARGET)_$(VERSION)-1_$(ARCH).deb
+	rm -f *.o $(TARGET)
+	rm -rf debian
+	rm -f *.deb
+
+# =========================
+# DEB PACKAGE
+# =========================
 
 deb: $(TARGET)
-	@echo "Building DEB package..."
-	@mkdir -p debian/$(TARGET)/usr/local/bin
-	@mkdir -p debian/$(TARGET)/DEBIAN
-	@cp $(TARGET) debian/$(TARGET)/usr/local/bin/
-	
-	@echo "Package: $(PACKAGE)" > debian/$(TARGET)/DEBIAN/control
-	@echo "Version: $(VERSION)-1" >> debian/$(TARGET)/DEBIAN/control
-	@echo "Architecture: $(ARCH)" >> debian/$(TARGET)/DEBIAN/control
-	@echo "Maintainer: Student <student@example.com>" >> debian/$(TARGET)/DEBIAN/control
-	@echo "Description: Custom shell with VFS support" >> debian/$(TARGET)/DEBIAN/control
-	@echo " A shell implementation with virtual filesystem for user information" >> debian/$(TARGET)/DEBIAN/control
-	
-	fakeroot dpkg-deb --build debian/$(TARGET) $(TARGET)_$(VERSION)-1_$(ARCH).deb
-	@echo "✅ DEB package created: $(TARGET)_$(VERSION)-1_$(ARCH).deb"
+	@echo "📦 Building DEB package..."
 
-install: $(TARGET)
-	cp $(TARGET) /usr/local/bin/
-	@echo "Installed to /usr/local/bin/$(TARGET)"
+	mkdir -p $(DEB_DIR)/usr/local/bin
+	mkdir -p $(DEB_DIR)/DEBIAN
+
+	cp $(TARGET) $(DEB_DIR)/usr/local/bin/
+
+	echo "Package: $(PACKAGE)" >  $(DEB_DIR)/DEBIAN/control
+	echo "Version: $(VERSION)" >> $(DEB_DIR)/DEBIAN/control
+	echo "Architecture: $(ARCH)" >> $(DEB_DIR)/DEBIAN/control
+	echo "Maintainer: Student <student@example.com>" >> $(DEB_DIR)/DEBIAN/control
+	echo "Description: Custom shell with VFS support" >> $(DEB_DIR)/DEBIAN/control
+
+	fakeroot dpkg-deb --build $(DEB_DIR) $(DEB_OUT)
+
+	@echo "✅ DEB created: $(DEB_OUT)"
+
+install: deb
+	apt install -y ./$(DEB_OUT)
 
 uninstall:
-	rm -f /usr/local/bin/$(TARGET)
-	@echo "Uninstalled from /usr/local/bin/$(TARGET)"
+	apt remove -y $(PACKAGE)
 
 test:
-	@echo "To run tests, install pytest and run:"
-	@echo "  python3 -m pytest test_basic.py test_vfs.py -v"
-	@echo ""
-	@echo "Note: VFS tests require FUSE3 and may need special setup"
+	pytest -v
