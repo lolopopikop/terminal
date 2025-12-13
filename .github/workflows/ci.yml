@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     container:
-      image: bebra11111111/my-shell-app:latest
+      image: lolopopikop/kubsh_test:local
       options: --privileged
 
     steps:
