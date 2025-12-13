@@ -1,5 +1,7 @@
 #include <iostream>
 #include <string>
+#include <fstream>
+#include <cstdlib>
 #include <vector>
 #include <sstream>
 #include <unistd.h>
@@ -8,10 +10,10 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <pwd.h>
-#include <atomic>
-#include <fstream>
+#include <algorithm>
 #include <readline/readline.h>
 #include <readline/history.h>
+#include <atomic>
 
 extern char **environ;
 
@@ -19,7 +21,7 @@ extern "C" {
 #include "vfs.h"
 }
 
-static std::atomic<bool> running(true);
+std::atomic<bool> running(true);
 
 void cleanup() {
     running.store(false);
@@ -35,15 +37,15 @@ std::vector<std::string> split(const std::string& s) {
 }
 
 std::string find_executable(const std::string& cmd) {
-    char *path = getenv("PATH");
+    char* path = getenv("PATH");
     if (!path) return "";
 
     std::stringstream ss(path);
     std::string dir;
     while (std::getline(ss, dir, ':')) {
-        std::string p = dir + "/" + cmd;
-        if (access(p.c_str(), X_OK) == 0)
-            return p;
+        std::string full = dir + "/" + cmd;
+        if (access(full.c_str(), X_OK) == 0)
+            return full;
     }
     return "";
 }
@@ -51,22 +53,23 @@ std::string find_executable(const std::string& cmd) {
 int main() {
     atexit(cleanup);
 
-    struct stat st;
-    if (stat("/opt/users", &st) == -1) {
-        start_users_vfs("/opt/users");
-    }
+    // 🔴 ВАЖНО: VFS ТОЛЬКО ТУТ
+    start_users_vfs("/opt/users");
+
+    using_history();
 
     bool interactive = isatty(STDIN_FILENO);
 
     while (running.load()) {
-        char *line = nullptr;
+        char* line = nullptr;
 
         if (interactive) {
             line = readline("$ ");
         } else {
-            std::string input;
-            if (!std::getline(std::cin, input)) break;
-            line = strdup(input.c_str());
+            std::string s;
+            if (!std::getline(std::cin, s))
+                break;
+            line = strdup(s.c_str());
         }
 
         if (!line) break;
@@ -75,40 +78,34 @@ int main() {
         free(line);
 
         if (cmd.empty()) continue;
-        if (cmd == "\\q") break;
 
-        if (cmd.rfind("echo ", 0) == 0) {
-            std::cout << cmd.substr(5) << std::endl;
-            continue;
-        }
+        auto args = split(cmd);
+        if (args.empty()) continue;
 
-        auto tokens = split(cmd);
-        if (tokens.empty()) continue;
+        if (args[0] == "exit")
+            break;
 
-        if (tokens[0] == "cd") {
-            if (tokens.size() > 1) chdir(tokens[1].c_str());
-            continue;
-        }
-
-        std::string exe = find_executable(tokens[0]);
+        std::string exe = find_executable(args[0]);
         if (exe.empty()) {
-            std::cout << tokens[0] << ": command not found" << std::endl;
+            std::cout << args[0] << ": command not found\n";
             continue;
         }
 
-        std::vector<char*> args;
-        for (auto &s : tokens)
-            args.push_back(const_cast<char*>(s.c_str()));
-        args.push_back(nullptr);
+        std::vector<char*> argv;
+        for (auto& a : args)
+            argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
 
         pid_t pid = fork();
         if (pid == 0) {
-            execve(exe.c_str(), args.data(), environ);
+            execve(exe.c_str(), argv.data(), environ);
             _exit(127);
         } else {
-            waitpid(pid, nullptr, 0);
+            int st;
+            waitpid(pid, &st, 0);
         }
     }
 
+    cleanup();
     return 0;
 }
