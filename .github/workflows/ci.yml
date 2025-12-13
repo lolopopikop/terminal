@@ -28,10 +28,10 @@ jobs:
 
       - name: Collect deb artifact
         run: |
-          cp /mnt/kubsh_*.deb .
+          cp /mnt/kubsh.deb .
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
         with:
           name: kubsh-deb
-          path: kubsh_*.deb
+          path: kubsh.deb
