@@ -66,7 +66,6 @@ void list_partitions(const std::string& device) {
     system(cmd.c_str());
 }
 
-
 std::string get_history_file() {
     char* home = getenv("HOME");
     if (home) return std::string(home) + "/.kubsh_history";
