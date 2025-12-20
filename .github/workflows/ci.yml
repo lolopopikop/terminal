@@ -22,17 +22,12 @@ jobs:
           cp -r . /mnt/
 
 
-#      - name: Run check.sh inside container
-#       run: |
-#         chmod +x /opt/check.sh
-#         /opt/check.sh
-
-      - name: Wait for container to finish
+      - name: Run 
         run: |
-          # Контейнер сам выполнит CMD из Dockerfile (check.sh)
-          # Ждем пока он завершится и создаст kubsh.deb
-          timeout 60 bash -c 'while [ ! -f /mnt/kubsh.deb ]; do sleep 2; done'
-     
+        docker run --privileged \
+            -v $(pwd):/mnt \
+            lolopopikop/kubsh_test:local
+
       - name: Collect deb artifact
         run: |
           cp /mnt/kubsh.deb .
