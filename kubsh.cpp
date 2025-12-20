@@ -121,43 +121,127 @@ int main() {
         }
 
         // \l - list disk partitions
-        if (tokens[0] == "\\l") {
-            if (tokens.size() == 2) {
-                std::string device = tokens[1];
+        // \l - list disk partitions
+if (tokens[0] == "\\l") {
+    if (tokens.size() == 2) {
+        std::string device = tokens[1];
+        
+        // Проверяем, существует ли устройство
+        struct stat st;
+        if (stat(device.c_str(), &st) != 0) {
+            // Попробуем найти устройство в /proc/partitions
+            FILE* fp = fopen("/proc/partitions", "r");
+            if (fp) {
+                char line[256];
+                bool device_found = false;
+                bool partitions_found = false;
                 
-                // Проверяем, существует ли устройство
-                struct stat st;
-                if (stat(device.c_str(), &st) != 0) {
-                    std::cout << device << ": no such device" << std::endl;
-                    continue;
+                // Извлекаем имя устройства из пути
+                std::string dev_name = device;
+                size_t pos = dev_name.find_last_of('/');
+                if (pos != std::string::npos) {
+                    dev_name = dev_name.substr(pos + 1);
                 }
                 
-                // Используем fdisk для получения информации о разделах
-                std::string command = "fdisk -l " + device + " 2>/dev/null | grep '^/'";
+                std::cout << "Looking for device: " << dev_name << std::endl;
                 
-                FILE* pipe = popen(command.c_str(), "r");
-                if (!pipe) {
-                    std::cout << "Failed to execute fdisk" << std::endl;
-                    continue;
+                // Пропускаем заголовок
+                for (int i = 0; i < 2 && fgets(line, sizeof(line), fp); i++);
+                
+                while (fgets(line, sizeof(line), fp)) {
+                    char name[64];
+                    unsigned int major, minor, blocks;
+                    
+                    if (sscanf(line, "%u %u %u %63s", &major, &minor, &blocks, name) == 4) {
+                        std::string part_name(name);
+                        
+                        // Ищем само устройство
+                        if (part_name == dev_name) {
+                            device_found = true;
+                            std::cout << "Device found in /proc/partitions:" << std::endl;
+                            std::cout << "  " << device << " (major: " << major 
+                                      << ", minor: " << minor 
+                                      << ", blocks: " << blocks << ")" << std::endl;
+                        }
+                        
+                        // Ищем разделы этого устройства
+                        if (part_name.find(dev_name) == 0 && part_name.length() > dev_name.length()) {
+                            partitions_found = true;
+                            std::cout << "  Partition: /dev/" << part_name 
+                                      << " (" << blocks << " blocks)" << std::endl;
+                        }
+                    }
                 }
                 
-                char buffer[256];
-                bool found = false;
-                while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
-                    found = true;
-                    std::cout << buffer;
-                }
+                fclose(fp);
                 
-                pclose(pipe);
-                
-                if (!found) {
-                    std::cout << "No partitions found or unable to read partition table" << std::endl;
+                if (!device_found) {
+                    std::cout << device << ": no such device in /proc/partitions" << std::endl;
+                    
+                    // Покажем все доступные устройства
+                    std::cout << "\nAvailable block devices:" << std::endl;
+                    fp = fopen("/proc/partitions", "r");
+                    if (fp) {
+                        for (int i = 0; i < 2 && fgets(line, sizeof(line), fp); i++);
+                        while (fgets(line, sizeof(line), fp)) {
+                            char name[64];
+                            unsigned int major, minor, blocks;
+                            if (sscanf(line, "%u %u %u %63s", &major, &minor, &blocks, name) == 4) {
+                                std::cout << "  /dev/" << name << std::endl;
+                            }
+                        }
+                        fclose(fp);
+                    }
+                } else if (!partitions_found) {
+                    std::cout << "No partitions found for this device" << std::endl;
                 }
             } else {
-                std::cout << "Usage: \\l /dev/sda" << std::endl;
+                std::cout << device << ": no such device (cannot access /proc/partitions)" << std::endl;
             }
-            continue;
+        } else {
+            // Устройство существует, используем fdisk
+            std::string command = "fdisk -l " + device + " 2>/dev/null";
+            
+            FILE* pipe = popen(command.c_str(), "r");
+            if (!pipe) {
+                std::cout << "Failed to execute fdisk" << std::endl;
+                continue;
+            }
+            
+            char buffer[256];
+            bool found = false;
+            std::cout << "Partition table for " << device << ":" << std::endl;
+            while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
+                found = true;
+                std::cout << buffer;
+            }
+            
+            pclose(pipe);
+            
+            if (!found) {
+                std::cout << "No partition table or unable to read" << std::endl;
+            }
         }
+    } else {
+        std::cout << "Usage: \\l /dev/sda" << std::endl;
+        std::cout << "\nAvailable block devices from /proc/partitions:" << std::endl;
+        
+        FILE* fp = fopen("/proc/partitions", "r");
+        if (fp) {
+            char line[256];
+            for (int i = 0; i < 2 && fgets(line, sizeof(line), fp); i++);
+            while (fgets(line, sizeof(line), fp)) {
+                char name[64];
+                unsigned int major, minor, blocks;
+                if (sscanf(line, "%u %u %u %63s", &major, &minor, &blocks, name) == 4) {
+                    std::cout << "  /dev/" << name << std::endl;
+                }
+            }
+            fclose(fp);
+        }
+    }
+    continue;
+}
 
         std::string exe = find_executable(tokens[0]);
         if (exe.empty()) {
