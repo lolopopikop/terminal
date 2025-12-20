@@ -8,29 +8,24 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    container:
-      image: lolopopikop/kubsh_test:local
-      options: --privileged
-
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
 
-      - name: Copy project to /mnt
+      - name: Run tests in Docker
         run: |
-          mkdir -p /mnt
-          cp -r . /mnt/
-
-
-      - name: Run 
-        run: |
-        docker run --privileged \
+          docker run --privileged \
             -v $(pwd):/mnt \
             lolopopikop/kubsh_test:local
 
       - name: Collect deb artifact
         run: |
-          cp /mnt/kubsh.deb .
+          if [ -f kubsh.deb ]; then
+            echo "Found kubsh.deb"
+          else
+            # Ищем .deb файл
+            find . -name "*.deb" -exec cp {} kubsh.deb \;
+          fi
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
