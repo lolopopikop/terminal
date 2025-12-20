@@ -114,9 +114,48 @@ int main() {
             continue;
         }
 
-        // cd
+                // cd
         if (tokens[0] == "cd") {
             chdir(tokens.size() > 1 ? tokens[1].c_str() : getenv("HOME"));
+            continue;
+        }
+
+        // \l - list disk partitions
+        if (tokens[0] == "\\l") {
+            if (tokens.size() == 2) {
+                std::string device = tokens[1];
+                
+                // Проверяем, существует ли устройство
+                struct stat st;
+                if (stat(device.c_str(), &st) != 0) {
+                    std::cout << device << ": no such device" << std::endl;
+                    continue;
+                }
+                
+                // Используем fdisk для получения информации о разделах
+                std::string command = "fdisk -l " + device + " 2>/dev/null | grep '^/'";
+                
+                FILE* pipe = popen(command.c_str(), "r");
+                if (!pipe) {
+                    std::cout << "Failed to execute fdisk" << std::endl;
+                    continue;
+                }
+                
+                char buffer[256];
+                bool found = false;
+                while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
+                    found = true;
+                    std::cout << buffer;
+                }
+                
+                pclose(pipe);
+                
+                if (!found) {
+                    std::cout << "No partitions found or unable to read partition table" << std::endl;
+                }
+            } else {
+                std::cout << "Usage: \\l /dev/sda" << std::endl;
+            }
             continue;
         }
 
